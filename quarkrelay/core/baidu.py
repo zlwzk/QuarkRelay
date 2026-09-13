@@ -14,9 +14,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
+import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -31,7 +33,10 @@ from .errors import BaiduAuthError, BaiduError
 logger = logging.getLogger(__name__)
 
 PAN = "https://pan.baidu.com"
+PCS = "https://d.pcs.baidu.com"
 APP_ID = "250528"
+SLICE_SIZE = 4 * 1024 * 1024  # 百度网页端就是按 4MB 分片上传的
+SHARE_PWD_CHARS = "abcdefghijkmnpqrstuvwxyz23456789"
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -400,6 +405,199 @@ class BaiduClient:
             timeout=self.timeout,
         ).json()
         self._check(payload, context="删除")
+
+    # --------------------------------------------------------------- 上传侧
+    def _api_params(self, method: str = "") -> dict[str, str]:
+        params = {
+            "bdstoken": self.bdstoken,
+            "channel": "chunlei",
+            "web": "1",
+            "app_id": APP_ID,
+            "clienttype": "0",
+        }
+        if method:
+            params["method"] = method
+        return params
+
+    @staticmethod
+    def _slice_md5s(path: Path, slice_size: int = SLICE_SIZE) -> list[str]:
+        """按网页端规则算出每一片的 MD5（末片是剩下的全部）。"""
+        digests: list[str] = []
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(slice_size)
+                if not chunk:
+                    break
+                digests.append(hashlib.md5(chunk).hexdigest())
+        return digests or [hashlib.md5(b"").hexdigest()]
+
+    def _unique_name(self, directory: str, name: str) -> str:
+        stem, dot, suffix = name.rpartition(".")
+        base = stem if dot else name
+        ext = f".{suffix}" if dot else ""
+        taken = {item.name for item in self.list_dir(directory)}
+        for index in range(1, 200):
+            candidate = f"{base} ({index}){ext}"
+            if candidate not in taken:
+                return candidate
+        return f"{base} ({int(time.time())}){ext}"
+
+    def upload(
+        self,
+        local: str | Path,
+        remote_dir: str = "/",
+        *,
+        on_exists: str = "rename",
+        progress: ProgressCb | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> BaiduFile:
+        """把本地文件传到百度网盘：预上传（支持秒传）→ 分片上传 → 收尾。
+
+        on_exists: rename=同名自动加序号（默认）· skip=已有就跳过 · overwrite=先删再传。
+        """
+        path = Path(local)
+        if not path.is_file():
+            raise BaiduError(f"待上传的文件不存在：{path.name}")
+        size = path.stat().st_size
+        directory = self._normalize(remote_dir)
+        self.mkdir(directory)
+
+        name = path.name
+        existing = next(
+            (item for item in self.list_dir(directory) if item.name == name and not item.is_dir), None
+        )
+        if existing is not None:
+            if on_exists == "skip":
+                if progress and size:
+                    progress(size, size)
+                return existing
+            if on_exists == "overwrite":
+                self.delete([existing.path])
+            else:
+                name = self._unique_name(directory, name)
+
+        remote = self._normalize(f"{directory}/{name}")
+        slices = self._slice_md5s(path)
+        pre = self.session.post(
+            f"{PAN}/api/precreate",
+            params=self._api_params(),
+            data={
+                "path": remote,
+                "autoinit": "1",
+                "size": str(size),
+                "isdir": "0",
+                "block_list": json.dumps(slices),
+                "rtype": "3",
+            },
+            timeout=self.timeout,
+        ).json()
+        self._check(pre, context="预上传")
+        upload_id = str(pre.get("uploadid") or "")
+        if int(pre.get("return_type") or 0) != 2 or not upload_id:
+            # return_type != 2 说明服务端已有这个文件（秒传命中），不用再传数据
+            logger.info("百度秒传命中：%s", name)
+            if progress and size:
+                progress(size, size)
+            return self.find_file(remote) or BaiduFile(
+                fs_id=0, name=name, path=remote, size=size, is_dir=False
+            )
+
+        waiting = pre.get("block_list")
+        pending = (
+            [int(index) for index in waiting]
+            if isinstance(waiting, list) and waiting
+            else list(range(len(slices)))
+        )
+        uploaded = 0
+        with open(path, "rb") as handle:
+            for index in pending:
+                if should_cancel and should_cancel():
+                    raise BaiduError("任务已取消")
+                handle.seek(index * SLICE_SIZE)
+                chunk = handle.read(SLICE_SIZE)
+                result = self.session.post(
+                    f"{PCS}/rest/2.0/pcs/superfile2",
+                    params={
+                        "method": "upload",
+                        "type": "tmpfile",
+                        "path": remote,
+                        "uploadid": upload_id,
+                        "partseq": str(index),
+                        "app_id": APP_ID,
+                        "channel": "chunlei",
+                        "web": "1",
+                        "clienttype": "0",
+                        "bdstoken": self.bdstoken,
+                    },
+                    files={"file": (f"part{index}", chunk)},
+                    timeout=600,
+                ).json()
+                if result.get("md5") is None and not result.get("fs_id"):
+                    raise BaiduError(
+                        f"上传分片 {index} 失败：{result.get('error_msg') or result.get('error_code') or result}"
+                    )
+                uploaded += len(chunk)
+                if progress:
+                    progress(min(uploaded, size), size)
+
+        done = self.session.post(
+            f"{PAN}/api/create",
+            params=self._api_params(),
+            data={
+                "path": remote,
+                "size": str(size),
+                "isdir": "0",
+                "block_list": json.dumps(slices),
+                "uploadid": upload_id,
+                "rtype": "3",
+            },
+            timeout=self.timeout,
+        ).json()
+        self._check(done, context="上传收尾")
+        if progress and size:
+            progress(size, size)
+        return self.find_file(remote) or BaiduFile(
+            fs_id=0, name=name, path=remote, size=size, is_dir=False
+        )
+
+    # --------------------------------------------------------------- 分享创建
+    def create_share(
+        self,
+        paths: list[str],
+        *,
+        period: int = 0,
+        password: str = "",
+    ) -> dict[str, str]:
+        """给一批文件/目录建分享，返回 {"link", "pwd", "period"}。period 0 表示永久。"""
+        fs_ids: list[int] = []
+        for path in paths:
+            item = self.find_file(self._normalize(path))
+            if item is None:
+                raise BaiduError(f"找不到要分享的内容：{path}")
+            fs_ids.append(item.fs_id)
+        if not fs_ids:
+            raise BaiduError("没有可分享的内容")
+        pwd = password or "".join(secrets.choice(SHARE_PWD_CHARS) for _ in range(4))
+        payload = self.session.post(
+            f"{PAN}/share/set",
+            params=self._api_params(),
+            data={
+                "fid_list": json.dumps(fs_ids),
+                "schannel": "4",
+                "channel_list": json.dumps([4]),
+                "period": str(period),
+                "pwd": pwd,
+                "pc_modify_permission": "0",
+            },
+            timeout=self.timeout,
+        ).json()
+        self._check(payload, context="创建分享")
+        link = str(payload.get("link") or "")
+        if link.startswith("http://"):
+            link = "https://" + link[len("http://") :]
+        if not link:
+            raise BaiduError("百度没有返回分享链接，请稍后重试")
+        return {"link": link, "pwd": str(payload.get("pwd") or pwd), "period": str(period)}
 
     # --------------------------------------------------------------- 直链下载
     def dlink_headers(self, referer: str = "") -> dict[str, str]:

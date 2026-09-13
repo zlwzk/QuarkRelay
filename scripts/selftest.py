@@ -1,8 +1,10 @@
-"""轻量自检：不联网、不弹窗，只验证核心逻辑与界面能不能正常装配。
+"""轻量自检：不弹窗，只验证核心逻辑与界面能不能正常装配。
 
 运行：
     python scripts/selftest.py           # 含离屏界面冒烟测试
     python scripts/selftest.py --no-ui   # 只测核心逻辑（无 Qt 环境时用）
+
+唯一会摸网络的是「检查更新」，而且只是尽力而为：连不上就按「离线降级」判通过。
 
 所有测试都跑在临时目录里（QUARKRELAY_HOME 指向 %TEMP%），不会碰你 %APPDATA% 下的真实数据。
 """
@@ -264,15 +266,117 @@ def test_ui() -> str:
     services = AppServices()
     window = MainWindow(services, theme="dark")
     pages = list(window._pages)  # noqa: SLF001 - 自检里直接看内部结构
-    assert len(pages) >= 8, f"页面数量不对：{pages}"
-    for key in ("transfer", "screenshot", "baidu", "tasks", "history", "accounts", "settings", "about"):
+    assert len(pages) >= 7, f"页面数量不对：{pages}"
+    for key in ("transfer", "baidu", "tasks", "history", "accounts", "settings", "about"):
         assert key in pages, f"缺少页面 {key}"
+    assert "screenshot" not in pages, "截图识链不该再占一个独立页面"
+
+    # 截图小按钮应该长在需要输入链接的两个页面上
+    for key in ("transfer", "baidu"):
+        assert getattr(window._pages[key], "shot", None) is not None, f"{key} 页没有截图按钮"
+
+    # 跨盘搬运页的方向切换
+    relay_page = window._pages["baidu"]
+    relay_page.set_direction(1)
+    assert "夸克分享链接" in relay_page.source_card.title_label.text(), "切到夸克方向后标题没变"
+    assert relay_page.make_share.text().endswith("百度分享链接"), relay_page.make_share.text()
+    relay_page.set_direction(0)
+    assert "百度分享链接" in relay_page.source_card.title_label.text(), "切回百度方向后标题没变"
+
     window.show()
     window.navigate("about")
     app.processEvents()
     window.close()
     services.shutdown()
-    return f"{len(pages)} 个页面已装配"
+    return f"{len(pages)} 个页面已装配，双向搬运与截图按钮就位"
+
+
+@check("检查更新：版本比较与降级路径")
+def test_updater() -> str:
+    from pathlib import Path
+
+    from quarkrelay import __version__
+    from quarkrelay.core import updater
+
+    assert updater.is_newer("1.10.0", "1.9.9"), "版本要按数字段比较，不能按字符串"
+    assert not updater.is_newer("1.0.0", "1.0.0"), "同版本不该算有更新"
+    assert not updater.is_newer("1.0.0", "1.1.0"), "更旧的版本不该算有更新"
+    assert updater.is_newer("v2.0.0"), "带 v 前缀的 tag 也要认"
+
+    assert updater.UpdateInfo().has_asset is False
+    assert updater.latest_download_url().endswith("/releases/latest")
+
+    # 自检跑在源码模式：必须优雅降级，而不是抛未知异常或真去替换自己
+    assert updater.current_exe() is None, "自检不该在打包环境里跑"
+    assert updater.can_self_update() is False
+    for call in (
+        lambda: updater.apply_update(Path("does-not-exist.exe")),
+        lambda: updater.download(updater.UpdateInfo(version="9.9.9")),
+    ):
+        try:
+            call()
+        except updater.UpdateError as exc:
+            assert str(exc), "错误信息不能为空"
+        else:
+            raise AssertionError("这些路径都应该抛 UpdateError")
+
+    # 真跑一遍替换脚本：等进程退出 → 挪走旧文件 → 挪进新文件 → 脚本自清理。
+    # 自动更新最容易出问题的就是这段批处理，所以不靠「看着像对」通过。
+    import subprocess
+
+    with tempfile.TemporaryDirectory(prefix="qr-update-") as work:
+        root = Path(work)
+        target = root / "app.exe"
+        source = root / "new.exe"
+        target.write_bytes(b"OLD-BUILD")
+        source.write_bytes(b"NEW-BUILD")
+
+        # 起一个两三秒后自己退出的进程，脚本里的「等 PID 结束」等的就是它
+        sleeper = subprocess.Popen(
+            ["cmd", "/c", "ping -n 3 127.0.0.1 >NUL"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        script = root / "apply.bat"
+        updater._write_script(  # noqa: SLF001 - 这段批处理是自检的重点，必须直接验
+            updater._render_script(target, source, sleeper.pid, restart=False, workdir=root),
+            script,
+        )
+        # 必须按真实启动方式来跑：DETACHED_PROCESS 下这个 cmd 没有控制台，
+        # 而管道（a | b）在无控制台进程里会永久挂住 —— 曾经就是这么静悄悄卡住的。
+        # 所以这里也分离启动，再轮询结果，而不是 subprocess.run 等它返回。
+        detached = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+        subprocess.Popen(
+            ["cmd", "/c", str(script)],
+            cwd=str(script.parent),
+            creationflags=detached,
+            close_fds=True,
+        )
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if not script.exists() and not source.exists():
+                break
+            time.sleep(0.3)
+        sleeper.wait(timeout=30)
+        assert target.read_bytes() == b"NEW-BUILD", (
+            f"替换脚本没把新版本放到位，见 {root / 'update.log'}"
+        )
+        assert not source.exists(), "新版本文件应该已经挪走"
+        assert not (root / "app.exe.old").exists(), "备份文件应该被清掉"
+        assert not script.exists(), "脚本应该删掉自己"
+
+    # 真连一次 GitHub；断网就当作「离线降级」通过，自检不该因为没网而失败
+    info = updater.check(timeout=8)
+    if info.error:
+        assert info.message.startswith("检查更新失败"), info.message
+        return f"替换脚本跑通，离线降级正常（{info.error[:40]}）"
+    return (
+        f"替换脚本跑通 · GitHub 最新版 {info.version or '未知'} / "
+        f"本地 v{__version__}：{info.message}"
+    )
 
 
 def main(argv: list[str]) -> int:
@@ -288,7 +392,17 @@ def main(argv: list[str]) -> int:
 
         QApplication.instance() or QApplication(sys.argv[:1])
 
-    tests = [test_compile, test_docs_sync, test_links, test_naming, test_net, test_config, test_store, test_tasks]
+    tests = [
+        test_compile,
+        test_docs_sync,
+        test_links,
+        test_naming,
+        test_net,
+        test_config,
+        test_store,
+        test_tasks,
+        test_updater,
+    ]
     if "--no-ui" not in argv:
         tests.append(test_close_quits)
         tests.append(test_ui)

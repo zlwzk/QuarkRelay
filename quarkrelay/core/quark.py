@@ -116,8 +116,15 @@ class QuarkClient:
 
     # ----------------------------------------------------------- 基础请求层
     def _signature(self, method: str, path: str) -> tuple[str, str]:
+        """算出 (x-pan-tm, x-pan-token)。
+
+        **签名只覆盖「方法 + 路径 + 时间戳 + 密钥」，查询串一律不参与。**
+        把 `?page_code=xxx` 一起签进去会直接拿到 errno 10001「签名验证失败」，
+        所以这里统一裁掉 `?` 之后的部分，避免调用方踩坑。
+        """
+        sign_path = path.split("?", 1)[0]
         tm = str(int(time.time() * 1000))
-        raw = f"{method.upper()}&{path}&{tm}&{SIGN_KEY}"
+        raw = f"{method.upper()}&{sign_path}&{tm}&{SIGN_KEY}"
         return tm, hashlib.sha256(raw.encode()).hexdigest()
 
     def request(
@@ -183,15 +190,15 @@ class QuarkClient:
 
             if errno in (10001,) and attempt == 0:
                 # 时间戳漂移或签名抖动，重试一次
-                last_error = QuarkError(info, errno=errno)
+                last_error = QuarkError(info, code=errno)
                 time.sleep(0.5)
                 continue
             if errno in (11001, 31001):
                 if _retry_auth and self.refresh_access_token():
                     _retry_auth = False
                     continue
-                raise QuarkAuthError(info, errno=errno)
-            raise QuarkError(info, errno=errno, payload=payload)
+                raise QuarkAuthError(info, code=errno)
+            raise QuarkError(info, code=errno, payload=payload)
 
         raise QuarkError(f"网络请求失败：{last_error}")
 
@@ -218,21 +225,42 @@ class QuarkClient:
             "device_id": str(data.get("device_id") or self.auth.device_id),
         }
 
-    def poll_authorize_code(self, page_code: str, timeout: float = 300.0, interval: float = 2.0) -> str:
-        """轮询授权结果，返回 agent_auth_code。"""
+    def poll_authorize_code(
+        self,
+        page_code: str,
+        timeout: float = 300.0,
+        interval: float = 2.0,
+        on_tick: Callable[[str], None] | None = None,
+    ) -> str:
+        """轮询授权结果，返回 agent_auth_code。
+
+        授权期间接口可能返回「还没授权」之类的错误码，这属于正常等待状态，
+        不能当成失败退出 —— 否则用户刚点完同意就被判失败（之前就是这么挂的）。
+        """
         deadline = time.monotonic() + timeout
+        last_note = "等待你在授权页上完成登录并点击同意"
         while time.monotonic() < deadline:
-            data = self.request(
-                "GET",
-                f"/agent/v1/oauth/get_aac_by_pagecode?page_code={page_code}",
-                auth=False,
-                retries=0,
-            )
-            code = data.get("agent_auth_code") or ""
-            if code:
-                return str(code)
+            try:
+                data = self.request(
+                    "GET",
+                    f"/agent/v1/oauth/get_aac_by_pagecode?page_code={page_code}",
+                    auth=False,
+                    retries=0,
+                )
+                code = data.get("agent_auth_code") or ""
+                if code:
+                    return str(code)
+                # status=1 表示「页面还没确认授权」，继续等
+                last_note = "已扫码，等待你在授权页上点击「同意授权」"
+            except QuarkAuthError:
+                raise
+            except QuarkError as exc:
+                last_note = f"仍在等待授权（{exc}）"
+                logger.debug("轮询授权码：%s", exc)
+            if on_tick:
+                on_tick(last_note)
             time.sleep(interval)
-        raise QuarkError("授权超时，请重新登录")
+        raise QuarkError(f"授权超时：{last_note}")
 
     def exchange_auth_code(self, auth_code: str) -> QuarkAuth:
         data = self.request(

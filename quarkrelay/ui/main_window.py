@@ -22,14 +22,12 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __app_name__, __version__
-from ..core import updater
 from ..core.hotkey import GlobalHotkey
 from ..paths import APP_DIR, pretty
-from .pages.baidu import BaiduRelayPage
 from .pages.accounts import AccountsPage
 from .pages.about import AboutPage
+from .pages.baidu import CrossRelayPage
 from .pages.history import HistoryPage
-from .pages.screenshot import ScreenshotPage
 from .pages.settings import SettingsPage
 from .pages.tasks import TasksPage
 from .pages.transfer import TransferPage
@@ -73,7 +71,7 @@ class MainWindow(QMainWindow):
         self._build_tray()
         self._wire_services()
         self._hotkey = GlobalHotkey(self)
-        self._hotkey.activated.connect(lambda: self.navigate("screenshot", capture_region=True))
+        self._hotkey.activated.connect(self.trigger_screenshot)
         spec = str(self.services.config.get("app.hotkey_screenshot", "Ctrl+Alt+Q") or "")
         if spec:
             if self._hotkey.register(spec):
@@ -82,7 +80,9 @@ class MainWindow(QMainWindow):
                 logger.info("全局快捷键未能注册：%s", spec)
 
         self.navigate("transfer")
-        QTimer.singleShot(2500, self._check_update)
+        quiet = bool(os.environ.get("QUARKRELAY_SELFCHECK"))
+        if not quiet and bool(self.services.config.get("app.auto_check_update", True)):
+            QTimer.singleShot(2500, self._check_update)
 
     # ---------------------------------------------------------------- 侧边栏
     def _build_sidebar(self) -> QWidget:
@@ -113,8 +113,7 @@ class MainWindow(QMainWindow):
 
         entries = [
             ("transfer", "夸克中转", TransferPage),
-            ("screenshot", "截图识链", ScreenshotPage),
-            ("baidu", "百度 → 夸克", BaiduRelayPage),
+            ("baidu", "跨盘搬运", CrossRelayPage),
             ("tasks", "任务中心", TasksPage),
             ("history", "历史记录", HistoryPage),
             ("accounts", "账号管理", AccountsPage),
@@ -165,8 +164,7 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         for key, _label, cls in (
             ("transfer", "", TransferPage),
-            ("screenshot", "", ScreenshotPage),
-            ("baidu", "", BaiduRelayPage),
+            ("baidu", "", CrossRelayPage),
             ("tasks", "", TasksPage),
             ("history", "", HistoryPage),
             ("accounts", "", AccountsPage),
@@ -174,14 +172,12 @@ class MainWindow(QMainWindow):
             ("about", "", AboutPage),
         ):
             page = cls(self.services)
-            if isinstance(page, ScreenshotPage):
-                page.send_to_transfer = self.send_to_transfer
             self._pages[key] = page
             self.stack.addWidget(page)
         return self.stack
 
     # ---------------------------------------------------------------- 导航
-    def navigate(self, key: str, *, capture_region: bool = False) -> None:
+    def navigate(self, key: str) -> None:
         page = self._pages.get(key)
         if page is None:
             return
@@ -192,29 +188,25 @@ class MainWindow(QMainWindow):
         refresh = getattr(page, "refresh", None)
         if callable(refresh):
             refresh()
-        if capture_region:
-            self.hide()
-            QTimer.singleShot(
-                220,
-                lambda: (
-                    page._start_region() if hasattr(page, "_start_region") else None
-                ),
-            )
-            QTimer.singleShot(260, self.show)
-            self.show()
 
     def _page_key(self, index: int) -> str:
         return list(self._pages.keys())[index] if index < len(self._pages) else ""
 
-    def send_to_transfer(self, text: str) -> None:
-        page = self._pages.get("transfer")
-        if page is None:
+    def trigger_screenshot(self) -> None:
+        """全局快捷键 / 托盘里的「截图识链」：直接交给当前页的小相机按钮。
+
+        截图按钮长在需要输入链接的页面上（夸克中转、跨盘搬运），
+        所以在哪一页就识别哪种链接；当前页没有按钮时退回夸克中转页。
+        """
+        page = self.stack.currentWidget()
+        button = getattr(page, "shot", None)
+        if button is None:
+            self.navigate("transfer")
+            button = getattr(self._pages.get("transfer"), "shot", None)
+        if button is None:
             return
-        current = page.input.toPlainText().strip()
-        if text and text not in current:
-            page.input.setPlainText((current + "\n" + text).strip())
-        self.navigate("transfer")
-        Toast.show_message(self, "已把链接送到「夸克中转站」", "success")
+        self._restore()
+        QTimer.singleShot(150, button.capture_region)
 
     # ---------------------------------------------------------------- 服务
     def _wire_services(self) -> None:
@@ -280,7 +272,7 @@ class MainWindow(QMainWindow):
         show_action.triggered.connect(self._restore)
         menu.addAction(show_action)
         shot_action = QAction("截图识链", self)
-        shot_action.triggered.connect(lambda: self.navigate("screenshot", capture_region=True))
+        shot_action.triggered.connect(self.trigger_screenshot)
         menu.addAction(shot_action)
         open_action = QAction("打开数据目录", self)
         open_action.triggered.connect(lambda: os.startfile(APP_DIR))  # noqa: S606
@@ -341,13 +333,7 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- 更新
     def _check_update(self) -> None:
-        import threading
-
-        def _worker() -> None:
-            info = updater.check()
-            if info.has_update:
-                self.services.toast.emit(
-                    f"发现新版本 v{info.version}，可在「关于」页查看", "info"
-                )
-
-        threading.Thread(target=_worker, name="update-check", daemon=True).start()
+        """启动后静默查一次版本；发现新版本时提示（可选自动下载安装）。"""
+        page = self._pages.get("about")
+        if page is not None and hasattr(page, "check_for_update"):
+            page.check_for_update(silent=True)

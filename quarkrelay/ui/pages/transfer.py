@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 from ...core.links import ShareLink, extract
 from ...core.naming import render_many
 from ...core.quark import EXPIRED_TYPES
+from ..shot import ScreenshotButton, link_text, pick_links
 from ..widgets import Badge, Card, CopyRow, EmptyState, Toast, copy_text, palette
 from . import Page
 
@@ -106,12 +107,17 @@ class TransferPage(Page):
 
         body = self.scrollable()
 
+        # 页头右上角的小相机：截图 → 识别 → 直接填进下面的输入框
+        self.shot = ScreenshotButton(self, tip="截图识别夸克链接")
+        self.header.add_action(self.shot)
+        self.shot.links_found.connect(self._on_shot_links)
+
         # ---------------------------------------------------------- 输入区
         input_card = Card("粘贴夸克分享链接", "支持一次粘贴多条；链接后面的文字、提取码、二维码说明都可以一起丢进来，会自动识别。")
         self.input = QPlainTextEdit()
         self.input.setPlaceholderText(
             "例：https://pan.quark.cn/s/xxxxxxxx  提取码：abcd\n"
-            "也可以直接在当前页面按 Ctrl+V —— 复制到剪贴板的内容会被自动识别。"
+            "也可以直接在当前页面按 Ctrl+V，或点右上角的小相机截图识别（全局快捷键 Ctrl+Alt+Q）。"
         )
         self.input.setFixedHeight(96)
         self.input.textChanged.connect(self._debounce.start)
@@ -269,6 +275,17 @@ class TransferPage(Page):
         if addition and addition not in current:
             self.input.setPlainText((current + "\n" + addition).strip())
             Toast.show_message(self, f"已从剪贴板识别到 {len(quark_links)} 个夸克链接", "info")
+
+    def _on_shot_links(self, links) -> None:
+        """截图识别到的链接，挑出夸克的直接追加到输入框。"""
+        quark_links = pick_links(links, "quark")
+        if not quark_links:
+            Toast.show_message(self, "截图里没有夸克链接（百度链接请到「跨盘搬运」页处理）", "warning")
+            return
+        addition = "\n".join(link_text(link) for link in quark_links)
+        current = self.input.toPlainText().strip()
+        self.input.setPlainText((current + "\n" + addition).strip() if current else addition)
+        Toast.show_message(self, f"已从截图填入 {len(quark_links)} 条夸克链接", "success")
 
     def _rebuild_rows(self) -> None:
         text = self.input.toPlainText()

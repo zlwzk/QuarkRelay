@@ -48,6 +48,8 @@ DEFAULTS: dict[str, Any] = {
         "log_level": "INFO",
         "first_run": True,
         "last_version": "",
+        "auto_check_update": True,
+        "auto_install_update": True,
     },
 }
 

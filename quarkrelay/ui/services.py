@@ -27,11 +27,8 @@ from .browser import (
 
 logger = logging.getLogger(__name__)
 
-
-class _SignalBridge(QObject):
-    """把工作线程的结果搬回主线程。"""
-
-    done = Signal(object)
+# 历史记录里的「来源」标签：只有「百度 → 夸克」的素材是从百度来的，其余都是夸克
+SOURCE_BAIDU = {"baidu_relay"}
 
 
 class AppServices(QObject):
@@ -135,8 +132,9 @@ class AppServices(QObject):
 
         dialog = WebLoginDialog(
             "登录夸克网盘",
-            "在下方页面用夸克 App 扫码或账号登录并同意授权，成功后窗口会自动关闭。"
-            "登录数据只保存在本机 %APPDATA%\\QuarkRelay，不影响系统浏览器里的登录状态。",
+            "在下方页面用夸克 App 扫码或账号登录并同意授权。授权结果由后台自动确认，"
+            "成功后会立即关闭本窗口；登录数据只保存在本机 %APPDATA%\\QuarkRelay，"
+            "不影响系统浏览器里的登录状态。",
             info["authorize_page_url"],
             "quark",
             done_text="我已授权完成",
@@ -144,47 +142,56 @@ class AppServices(QObject):
         )
 
         box: dict[str, Any] = {}
-        bridge = _SignalBridge(self)
-
-        def _close_if_open(_payload: object) -> None:
-            if dialog.isVisible():
-                dialog.accept()
-
-        bridge.done.connect(_close_if_open)
 
         def _worker() -> None:
+            """后台把「等授权 → 换令牌 → 取用户信息」一条龙做完。"""
             try:
-                box["code"] = client.poll_authorize_code(info["page_code"], timeout=280)
+                box["note"] = "等待你在授权页完成登录并点击「同意授权」"
+                box["code"] = client.poll_authorize_code(
+                    info["page_code"],
+                    timeout=280,
+                    on_tick=lambda note: box.__setitem__("note", note),
+                )
+                box["stage"] = "exchanging"
+                client.exchange_auth_code(str(box["code"]))
+                payload = client.user_info()
+                client.auth.nickname = str(payload.get("nickname") or "")
+                if not client.auth.user_id:
+                    client.auth.user_id = str(payload.get("user_id") or "")
+                box["ok"] = True
             except Exception as exc:  # noqa: BLE001
                 box["error"] = exc
-            bridge.done.emit(None)
 
         thread = threading.Thread(target=_worker, name="quark-auth", daemon=True)
         thread.start()
-        accepted = dialog.exec() == dialog.DialogCode.Accepted
-        thread.join(timeout=1.5)
 
-        code = box.get("code")
-        if not code:
+        def _state() -> tuple[bool, str]:
+            """(能否收工, 提示语)。授权码只在后台轮询里，所以由它来定何时关窗。"""
+            if box.get("ok"):
+                return True, "授权成功，正在保存登录状态…"
             if box.get("error"):
-                self.toast.emit(f"夸克授权未完成：{friendly(box['error'])}", "warning")
-            elif accepted:
-                self.toast.emit("还没拿到授权码，请再试一次", "warning")
-            return False
-        try:
-            client.exchange_auth_code(code)
-            payload = client.user_info()
-            client.auth.nickname = str(payload.get("nickname") or "")
-            if not client.auth.user_id:
-                client.auth.user_id = str(payload.get("user_id") or "")
-        except Exception as exc:  # noqa: BLE001
-            self.toast.emit(f"换取夸克访问令牌失败：{friendly(exc)}", "error")
-            return False
+                return True, f"授权失败：{friendly(box['error'])}"
+            if box.get("stage") == "exchanging":
+                return False, "已拿到授权码，正在换取访问令牌…"
+            if not thread.is_alive():
+                return True, "授权已中断"
+            return False, f"{box.get('note') or '等待你完成授权'}（完成后会自动继续）"
 
-        self.quark = client
-        self._persist_quark()
-        self.toast.emit("夸克网盘登录成功", "success")
-        return True
+        dialog.watch_result(_state)
+        dialog.exec()
+        if not box.get("ok"):
+            thread.join(timeout=1.0)
+
+        if box.get("ok"):
+            self.quark = client
+            self._persist_quark()
+            self.toast.emit("夸克网盘登录成功", "success")
+            return True
+        if box.get("error"):
+            self.toast.emit(f"夸克登录失败：{friendly(box['error'])}", "error")
+        else:
+            self.toast.emit("夸克授权还没完成，可以再点一次「登录夸克网盘」继续", "warning")
+        return False
 
     def login_baidu(self, parent=None) -> bool:
         dialog = WebLoginDialog(
@@ -199,7 +206,10 @@ class AppServices(QObject):
         )
         if dialog.exec() != dialog.DialogCode.Accepted:
             return False
-        cookie_text = cookie_string(dialog.cookies, BAIDU_KEYS) or cookie_string(dialog.cookies)
+        # 只认 baidu.com 域下的 cookie：不同域可能有同名项，混在一起会互相覆盖。
+        cookies = dialog.jar.cookies_for("baidu.com") if dialog.jar else dialog.cookies
+        cookies = cookies or dialog.cookies
+        cookie_text = cookie_string(cookies, BAIDU_KEYS) or cookie_string(cookies)
         if "BDUSS" not in cookie_text:
             self.toast.emit("没有取到会话信息（BDUSS），可能登录还没完成", "warning")
             return False
@@ -335,6 +345,50 @@ class AppServices(QObject):
             payload={"share": share_url, "code": password},
         )
 
+    def start_quark_to_baidu(
+        self,
+        link: ShareLink,
+        *,
+        quark_dir: str,
+        baidu_dir: str,
+        make_share: bool,
+        share_name: str,
+        keep_buffer: bool = False,
+        on_exists: str = "rename",
+        parent=None,
+    ) -> Task | None:
+        """夸克分享 → 转存到我的夸克 → 下载 → 上传百度（「百度 → 夸克」的反向）。"""
+        if not self.ensure_quark(parent):
+            return None
+        if not self.ensure_baidu(parent):
+            return None
+        quark, baidu = self.quark, self.baidu
+        speed = int(self.config.get("app.speed_limit_kbps", 0) or 0)
+
+        def worker(task: Task) -> dict[str, Any]:
+            return relay.quark_to_baidu_worker(
+                task,
+                quark,
+                baidu,
+                pwd_id=link.pwd_id,
+                passcode=link.code,
+                quark_dir=quark_dir,
+                baidu_dir=baidu_dir,
+                speed_kbps=speed,
+                keep_buffer=keep_buffer,
+                share_name=share_name,
+                make_share=make_share,
+                period=int(self.config.get("baidu.share_period", 0) or 0),
+                on_exists=on_exists,
+            )
+
+        return self.tasks.submit(
+            "quark_to_baidu",
+            f"夸克搬运到百度（{share_name or '未命名'}）",
+            worker,
+            payload={"source": link.url, "code": link.code},
+        )
+
     def start_export_share(self, names: list[str], share_name: str, target_dir: str = "", parent=None) -> Task | None:
         if not self.ensure_quark(parent):
             return None
@@ -360,7 +414,7 @@ class AppServices(QObject):
             self.toast.emit(f"{task.title} 失败：{task.error}", "error")
             text = task.error or ""
             if "登录" in text or "令牌" in text or "会话" in text:
-                if task.kind == "baidu_relay":
+                if task.kind in SOURCE_BAIDU:
                     self.baidu_changed.emit()
                 else:
                     self.quark_changed.emit()
@@ -378,7 +432,7 @@ class AppServices(QObject):
                 name=name,
                 link=link,
                 code=code,
-                source="baidu" if task.kind == "baidu_relay" else "quark",
+                source="baidu" if task.kind in SOURCE_BAIDU else "quark",
                 target_path=str(result.get("target_dir") or ""),
                 note="、".join(str(item) for item in (result.get("files") or []))[:300],
             )
@@ -387,8 +441,11 @@ class AppServices(QObject):
                 QGuiApplication.clipboard().setText(
                     str(result.get("combined") or render_for(name, link, code))
                 )
+        # 跨盘搬运会把文件挪进对方的网盘，对应的账号页/容量要刷新
         if task.kind == "baidu_relay":
             self.quark_changed.emit()
+        elif task.kind == "quark_to_baidu":
+            self.baidu_changed.emit()
         self.toast.emit(f"{task.title} 已完成", "success")
 
     # ---------------------------------------------------------------- 剪贴板

@@ -52,6 +52,9 @@ def profile(name: str) -> QWebEngineProfile:
     ensure_dirs()
     store_dir = WEB_DIR / name
     store_dir.mkdir(parents=True, exist_ok=True)
+    # 目录必须事先建好：CachePath 指向不存在的目录时 Chromium 会报
+    # 「Unable to move the cache」，缓存和 cookie 持久化都会受影响。
+    (store_dir / "cache").mkdir(parents=True, exist_ok=True)
     prof = QWebEngineProfile(name)
     prof.setPersistentStoragePath(str(store_dir))
     prof.setCachePath(str(store_dir / "cache"))
@@ -65,47 +68,110 @@ def profile(name: str) -> QWebEngineProfile:
 
 
 class CookieJar(QObject):
-    """一次性收集 Profile 里的全部 cookie。"""
+    """一次性收集 Profile 里的全部 cookie（含 HttpOnly 的那些）。
+
+    `loadAllCookies()` 只提供「逐个 cookieAdded」回调，没有「加载完成」信号。
+    之前固定 sleep 一段时间的写法，cookie 一多就会漏读 —— 登录信息读取不到位
+    就是这么来的。这里改成**等到回调流静默下来**为止：
+    至少等 min_ms，连续 quiet_ms 没有新 cookie 就收工，最多不超过 max_ms。
+    """
 
     def __init__(self, prof: QWebEngineProfile, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._cookies: dict[str, str] = {}
+        self._by_domain: dict[str, dict[str, str]] = {}
         self._details: list[dict[str, str]] = []
+        self._last_seen = 0.0
         self._store = prof.cookieStore()
         self._store.cookieAdded.connect(self._on_added)
 
+    @staticmethod
+    def _decode(raw: object) -> str:
+        try:
+            return bytes(raw).decode("utf-8", "ignore")  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return str(raw or "")
+
     def _on_added(self, cookie: QNetworkCookie) -> None:
-        name = bytes(cookie.name()).decode("utf-8", "ignore")
-        value = bytes(cookie.value()).decode("utf-8", "ignore")
+        name = self._decode(cookie.name())
+        value = self._decode(cookie.value())
         if not name:
             return
+        domain = (cookie.domain() or "").lstrip(".").lower()
         self._cookies[name] = value
+        self._by_domain.setdefault(domain, {})[name] = value
         self._details.append(
             {
                 "name": name,
                 "value": value,
-                "domain": cookie.domain(),
+                "domain": domain,
                 "path": cookie.path(),
             }
         )
+        self._last_seen = time.monotonic()
 
-    def collect(self, wait_ms: int = 900) -> dict[str, str]:
+    def collect(self, min_ms: int = 700, quiet_ms: int = 400, max_ms: int = 8000) -> dict[str, str]:
         loop = QEventLoop()
+        started = time.monotonic()
+        self._last_seen = started
         self._store.loadAllCookies()
-        QTimer.singleShot(wait_ms, loop.quit)
+
+        poll = QTimer(self)
+        poll.setInterval(120)
+        watchdog = QTimer(self)
+        watchdog.setSingleShot(True)
+
+        def tick() -> None:
+            elapsed = (time.monotonic() - started) * 1000
+            quiet = (time.monotonic() - self._last_seen) * 1000
+            if elapsed >= max_ms or (elapsed >= min_ms and quiet >= quiet_ms):
+                loop.quit()
+
+        poll.timeout.connect(tick)
+        watchdog.timeout.connect(loop.quit)
+        poll.start()
+        watchdog.start(int(max_ms))
         loop.exec()
+        poll.stop()
+        watchdog.stop()
         return dict(self._cookies)
 
+    def cookies_for(self, *domain_suffixes: str) -> dict[str, str]:
+        """按域名取 cookie。
 
-def read_cookies(prof: QWebEngineProfile, wait_ms: int = 900) -> dict[str, str]:
+        同名 cookie（比如 `BDUSS`）在不同域下可能值不同，合在一起会互相覆盖，
+        所以建会话时要按域名挑。
+        """
+        merged: dict[str, str] = {}
+        for domain, items in self._by_domain.items():
+            if any(domain == s or domain.endswith("." + s) for s in domain_suffixes):
+                merged.update(items)
+        return merged
+
+    @property
+    def cookies(self) -> dict[str, str]:
+        return dict(self._cookies)
+
+    @property
+    def by_domain(self) -> dict[str, dict[str, str]]:
+        return {domain: dict(items) for domain, items in self._by_domain.items()}
+
+
+def read_cookie_jar(prof: QWebEngineProfile, **kwargs: int) -> CookieJar:
+    """读一次 cookie，返回收集器（含按域名分组的信息）。"""
     jar = CookieJar(prof)
     try:
-        return jar.collect(wait_ms)
+        jar.collect(**kwargs)
     finally:
         try:
             jar._store.cookieAdded.disconnect(jar._on_added)
         except (RuntimeError, TypeError):
             pass
+    return jar
+
+
+def read_cookies(prof: QWebEngineProfile, **kwargs: int) -> dict[str, str]:
+    return read_cookie_jar(prof, **kwargs).cookies
 
 
 def cookie_string(cookies: dict[str, str], keys: list[str] | None = None) -> str:
@@ -145,6 +211,9 @@ class WebLoginDialog(QDialog):
         self.cookie_keys = cookie_keys
         self._autodetect = autodetect
         self._detected = False
+        self.await_result: Callable[[], tuple[bool, str]] | None = None
+        self._await_timer: QTimer | None = None
+        self.jar: CookieJar | None = None
 
         self.prof = profile(profile_name)
         self.page = QWebEnginePage(self.prof, self)
@@ -204,9 +273,48 @@ class WebLoginDialog(QDialog):
     def _on_loaded(self, ok: bool) -> None:
         self.status.setText("页面已加载，请完成登录/授权" if ok else "页面加载失败，可点「重新加载」")
 
-    def _check(self, manual: bool = False) -> None:
+    def set_status(self, text: str) -> None:
+        self.status.setText(text)
+
+    def watch_result(self, callback: Callable[[], tuple[bool, str]], interval_ms: int = 1200) -> None:
+        """挂一个「后端结果查询」回调，返回 (能否收工, 给用户看的话)。
+
+        夸克这种登录，授权结果只存在于后端轮询里：用户点完「同意授权」时
+        cookie 里什么都看不出来，所以对话框既不能立刻关（授权码还没到），
+        也不能一直傻等 —— 交给这个回调判断，能收工时自动关闭。
+        """
+        self.await_result = callback
+        if self._await_timer is None:
+            self._await_timer = QTimer(self)
+            self._await_timer.setInterval(interval_ms)
+            self._await_timer.timeout.connect(self._poll_await)
+        self._await_timer.start()
+
+    def _poll_await(self) -> None:
+        if self.await_result is None:
+            return
         try:
-            cookies = read_cookies(self.prof, wait_ms=400 if manual else 200)
+            ready, message = self.await_result()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("查询授权结果失败：%s", exc)
+            return
+        if message:
+            self.status.setText(message)
+        if ready:
+            if self._await_timer:
+                self._await_timer.stop()
+            self.accept()
+
+    def _check(self, manual: bool = False) -> None:
+        # 轮询期间只做快速探测（cookie 已经在 Profile 里，回调来得很快），
+        # 别每次都等满静默窗口，否则界面会一顿一顿的。
+        try:
+            cookies = read_cookies(
+                self.prof,
+                min_ms=180,
+                quiet_ms=150,
+                max_ms=1500 if manual else 900,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.debug("读取 cookie 失败：%s", exc)
             return
@@ -227,14 +335,21 @@ class WebLoginDialog(QDialog):
         if self._timer:
             self._timer.stop()
         try:
-            cookies = read_cookies(self.prof, wait_ms=600)
-            if cookies:
-                self.cookies = cookies
+            # 收工前读一次完整的：等回调流真正静默下来，HttpOnly 的
+            # BDUSS / STOKEN 这类关键 cookie 才不会漏；同时留下带域名的
+            # jar，调用方可以只取某个域名下的 cookie。
+            self.jar = read_cookie_jar(self.prof, min_ms=800, quiet_ms=450, max_ms=8000)
+            if self.jar.cookies:
+                self.cookies = self.jar.cookies
         except Exception:  # noqa: BLE001
             pass
         if self._autodetect and self.cookies and not self._autodetect(self.cookies):
             keep = self.status.text()
             self.status.setText("似乎还没登录成功，再试一次？（" + keep + "）")
+            return
+        if self.await_result is not None:
+            # 结果由后端说了算：没到就继续等，别让用户白点一次
+            self._poll_await()
             return
         self.accept()
 

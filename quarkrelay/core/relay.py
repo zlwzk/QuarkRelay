@@ -322,6 +322,173 @@ def quark_export_share_worker(
     }
 
 
+# ------------------------------------------------- 流水线四：夸克 → 百度
+def quark_to_baidu_worker(
+    task: Task,
+    quark: QuarkClient,
+    baidu: BaiduClient,
+    *,
+    pwd_id: str,
+    passcode: str = "",
+    quark_dir: str = "夸克中转站",
+    baidu_dir: str = "/夸克中转站",
+    speed_kbps: int = 0,
+    keep_buffer: bool = False,
+    share_name: str = "",
+    make_share: bool = False,
+    period: int = 0,
+    on_exists: str = "rename",
+) -> dict[str, Any]:
+    """夸克分享 → 转存到我的夸克 → 下载到本地缓冲 → 上传百度网盘。
+
+    和「百度 → 夸克」正好反过来：同样不落桌面，缓冲区随用随删。
+    """
+    from ..paths import temp_buffer_dir  # 避免顶层循环导入
+
+    _stage(task, "解析夸克分享", 3)
+    detail = quark.share_detail(pwd_id, passcode)
+    stoken = str((detail.get("token_info") or {}).get("stoken") or "")
+    if not stoken:
+        raise QuarkError("分享已失效或提取码不正确")
+    items = [item for item in (detail.get("list") or []) if item.get("filename")]
+    if not items:
+        raise QuarkError("这个分享里没有可搬运的文件")
+
+    _check_cancel(task)
+    _stage(task, "转存到我的夸克网盘", 8)
+    quark_pdir = quark.ensure_dir(quark_dir)
+    saved = quark.share_saveas(pwd_id, stoken, to_pdir_fid=quark_pdir)
+    task_id = str(saved.get("task_id") or "")
+    if task_id:
+        status = quark.wait_task(
+            task_id, on_tick=lambda state: _stage(task, f"夸克转存中（状态 {state}）", 14)
+        )
+        if status == "3":
+            raise QuarkError("夸克转存失败：可能是网盘空间不足，或分享已失效")
+        if status == "4":
+            raise QuarkError("夸克转存任务被暂停，请稍后重试")
+
+    _check_cancel(task)
+    _stage(task, "定位转存后的文件", 18)
+    targets: list[tuple[str, str]] = []
+    for item in items:
+        filename = str(item.get("filename"))
+        fid = quark.find_fid(filename, quark_pdir)
+        if fid:
+            targets.append((filename, fid))
+    if not targets:
+        raise QuarkError("转存已完成，但没能定位到文件；可到夸克网盘里手动搬运")
+
+    _stage(task, "准备百度目标目录", 22)
+    baidu.mkdir(baidu_dir)
+
+    buffer_dir = temp_buffer_dir()
+    names: list[str] = []
+    remote_paths: list[str] = []
+    total_bytes = 0
+    started = time.monotonic()
+
+    for index, (filename, fid) in enumerate(targets, start=1):
+        _check_cancel(task)
+        base = 22 + (index - 1) / max(1, len(targets)) * 70
+        buffer_path = buffer_dir / f"quark_{fid}_{filename}"
+        meter = SpeedMeter()
+        throttle = Throttle(speed_kbps)
+        last_seen = [0]
+
+        def _on_download(
+            done: int,
+            total: int,
+            _base: float = base,
+            _meter: SpeedMeter = meter,
+            _name: str = filename,
+        ) -> None:
+            total_now = total or 1
+            fraction = min(1.0, done / total_now) if total_now else 0.0
+            _stage(
+                task,
+                f"下载 {_name} · {human_size(done)}/{human_size(total_now)}"
+                f" · {human_size(_meter.speed)}/s",
+                _base + fraction * 33,
+            )
+
+        def _wrapped(done: int, total: int) -> None:
+            delta = done - last_seen[0]
+            last_seen[0] = done
+            if delta > 0:
+                throttle(delta)
+            meter.update(done)
+            _on_download(done, total)
+
+        _stage(task, f"从夸克下载：{filename}", base)
+        quark.download_to(fid, buffer_path, progress=_wrapped)
+        size = buffer_path.stat().st_size
+        total_bytes += size
+
+        _check_cancel(task)
+        _stage(task, f"上传到百度网盘：{filename}", base + 36)
+
+        def _on_upload(
+            done: int,
+            total: int,
+            _base: float = base + 36,
+            _name: str = filename,
+            _size: int = size,
+        ) -> None:
+            total_now = total or _size or 1
+            fraction = min(1.0, done / total_now) if total_now else 0.0
+            _stage(
+                task,
+                f"上传 {_name} · {human_size(done)}/{human_size(total_now)}",
+                _base + fraction * 32,
+            )
+
+        uploaded = baidu.upload(
+            buffer_path,
+            baidu_dir,
+            on_exists=on_exists,
+            progress=_on_upload,
+            should_cancel=task.should_cancel,
+        )
+        names.append(uploaded.name)
+        remote_paths.append(uploaded.path)
+
+        if not keep_buffer:
+            try:
+                buffer_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.debug("删除缓冲文件失败：%s", exc)
+
+    if not names:
+        raise QuarkError("没有成功搬运任何文件")
+
+    elapsed = max(0.001, time.monotonic() - started)
+    summary: dict[str, Any] = {
+        "files": names,
+        "remote_paths": remote_paths,
+        "target_dir": baidu_dir,
+        "speed": total_bytes / elapsed if total_bytes else 0.0,
+        "elapsed": elapsed,
+        "bytes": total_bytes,
+    }
+
+    if make_share:
+        _stage(task, "生成百度分享链接", 95)
+        created = baidu.create_share(remote_paths, period=period)
+        title = share_name or build_name(names[0] if names else "")
+        summary.update(
+            {
+                "name": title,
+                "link": created["link"],
+                "code": created["pwd"],
+                "combined": render_for(title, created["link"], created["pwd"]),
+            }
+        )
+
+    _stage(task, "完成", 100)
+    return summary
+
+
 def result_to_record(result: dict[str, Any]) -> tuple[str, str, str]:
     """从 worker 结果里取出 (名字, 链接, 提取码)。"""
     return (

@@ -149,6 +149,39 @@ class SettingsPage(Page):
         run_card.add(self.notify)
         body.addWidget(run_card)
 
+        # ------------------------------------------------------------ 更新
+        update_card = Card(
+            "版本更新",
+            "直接读取 GitHub 上的 Release：检查版本、下载新版 exe、退出后自动替换并重启，"
+            "不需要手动去网页下载。",
+        )
+        self.auto_check = QCheckBox("启动时自动检查更新")
+        self.auto_check.setChecked(bool(cfg.get("app.auto_check_update", True)))
+        self.auto_check.stateChanged.connect(
+            lambda: cfg.set("app.auto_check_update", self.auto_check.isChecked())
+        )
+        update_card.add(self.auto_check)
+
+        self.auto_install = QCheckBox("发现新版本时自动下载并安装（有任务在跑时会推迟）")
+        self.auto_install.setChecked(bool(cfg.get("app.auto_install_update", True)))
+        self.auto_install.stateChanged.connect(
+            lambda: cfg.set("app.auto_install_update", self.auto_install.isChecked())
+        )
+        update_card.add(self.auto_install)
+
+        update_row = QHBoxLayout()
+        update_row.setSpacing(8)
+        check_now = QPushButton("立即检查更新")
+        check_now.setObjectName("Ghost")
+        check_now.clicked.connect(self._check_update_now)
+        update_row.addWidget(check_now)
+        update_row.addStretch(1)
+        self.update_hint = QLabel("")
+        self.update_hint.setObjectName("Faint")
+        update_row.addWidget(self.update_hint)
+        update_card.add_layout(update_row)
+        body.addWidget(update_card)
+
         # ------------------------------------------------------------ 界面
         ui_card = Card("界面")
         row = QHBoxLayout()
@@ -230,3 +263,13 @@ class SettingsPage(Page):
         self.services.quark_changed.emit()
         self.services.baidu_changed.emit()
         Toast.show_message(self, "已清除本机保存的登录凭据", "success")
+
+    def _check_update_now(self) -> None:
+        window = self.window()
+        page = getattr(window, "_pages", {}).get("about") if hasattr(window, "_pages") else None
+        if page is None:
+            Toast.show_message(self, "请到「关于」页检查更新", "info")
+            return
+        if hasattr(window, "navigate"):
+            window.navigate("about")
+        page.check_for_update()

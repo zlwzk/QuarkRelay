@@ -312,6 +312,22 @@ QPushButton#IconBtn:hover {{
     background: {p.surface_alt};
     color: {p.text};
 }}
+QPushButton#Seg {{
+    background: {p.surface_alt};
+    border: 1px solid {p.border};
+    color: {p.text_dim};
+    padding: 8px 18px;
+}}
+QPushButton#Seg:hover {{
+    background: {p.elevated};
+    color: {p.text};
+}}
+QPushButton#Seg:checked {{
+    background: {p.primary_soft};
+    border-color: {p.primary};
+    color: {p.text};
+    font-weight: 600;
+}}
 
 /* ------------------------------------------------------------ 输入类控件 */
 QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QComboBox {{

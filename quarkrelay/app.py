@@ -131,6 +131,8 @@ def self_check() -> int:
 
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.*=false")
+    # 自检不该联网查版本，否则报告要等几十秒
+    os.environ["QUARKRELAY_SELFCHECK"] = "1"
 
     qt_messages: list[str] = []
 
