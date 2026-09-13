@@ -2,8 +2,12 @@
 
 Windows 上运行中的 exe 没法覆盖自己，所以自动更新分三步：
 1. 把新版下载到 `%APPDATA%\\QuarkRelay\\update\\`，校验文件头和大小（有 sha256 就再校验一遍）；
-2. 生成一个批处理，等本进程退出后把旧 exe 挪走、把新版挪进来、再启动程序；
+2. 生成一个批处理，等本进程退出后把旧 exe 挪走、把新版挪进来、删掉旧版本文件与安装包残留、
+   再启动程序；
 3. 调用方收到「脚本已启动」后立刻退出，剩下的活交给脚本。
+
+替换脚本万一没跑完（程序被强杀、替换失败），启动时 `cleanup_after_update()` 会兜底把
+旧版本文件与下载下来的安装包再清一次，不留 262 MB 的包在用户机器上。
 
 程序目录不可写（比如装在 `Program Files` 又没提权）时不硬来，只提示手动下载。
 """
@@ -18,7 +22,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import requests
@@ -31,7 +35,14 @@ logger = logging.getLogger(__name__)
 
 API = "https://api.github.com/repos/zlwzk/QuarkRelay/releases/latest"
 UPDATE_DIR = APP_DIR / "update"
+UPDATE_LOG_NAME = "update.log"
+UPDATE_SCRIPT_NAME = "apply-update.bat"
 USER_AGENT = "QuarkRelay-Updater"
+
+# 更新脚本从启动到收工最长约两分钟（等旧进程 60 秒 + 替换重试 + 启动新版本）。
+# 启动时看到还在这个时间窗内的脚本，说明替换可能正在进行，不要动它的文件。
+PENDING_GRACE_SECONDS = 300
+BACKUP_SUFFIX = ".old"
 
 
 class UpdateError(Exception):
@@ -242,11 +253,14 @@ def _verify(path: Path, info: UpdateInfo) -> None:
 # 注意：脚本里刻意不出现管道（a | b）。本进程是用 DETACHED_PROCESS 拉起来的，
 # 这种「没有控制台」的 cmd 里管道会永久挂住（tasklist | find 永远不返回），
 # 于是更新会静悄悄卡在第一步。要过滤输出就把结果先落盘、再让 find 读文件。
-_SCRIPT = """@echo off
+_SCRIPT = r"""@echo off
 setlocal
 {charset}set "TARGET={target}"
 set "SOURCE={source}"
 set "TARGETDIR={targetdir}"
+set "TARGETNAME={targetname}"
+set "UPDATEDIR={updatedir}"
+set "BACKUP=%TARGET%.old"
 set "PID={pid}"
 set "TEMPFILE={tempfile}"
 set "LOGFILE={logfile}"
@@ -268,24 +282,57 @@ goto wait
 rem 先备份再替换：万一新版挪不过去还能滚回来
 :replace
 if not exist "%SOURCE%" goto giveup
-if exist "%TARGET%" move /y "%TARGET%" "%TARGET%.old" >NUL 2>&1
+if exist "%TARGET%" move /y "%TARGET%" "%BACKUP%" >NUL 2>&1
 move /y "%SOURCE%" "%TARGET%" >NUL 2>&1
-if not exist "%SOURCE%" goto done
+if not exist "%SOURCE%" goto dropold
 rem 被杀软或资源管理器占用时会失败，收回备份、隔一秒再来
-if exist "%TARGET%.old" if not exist "%TARGET%" move /y "%TARGET%.old" "%TARGET%" >NUL 2>&1
+if exist "%BACKUP%" if not exist "%TARGET%" move /y "%BACKUP%" "%TARGET%" >NUL 2>&1
 set /a tries+=1
 if %tries% geq 30 goto giveup
 ping -n 2 127.0.0.1 >NUL
 goto replace
 
-:done
-del /q "%TARGET%.old" >NUL 2>&1
-cd /d "%TARGETDIR%"
-{restart}
+rem 旧版本的 exe 删掉：刚退出的文件有时还被资源管理器或杀软占着，多试几次
+:dropold
+set /a tries=0
+:dropold_retry
+if not exist "%BACKUP%" goto cleanpack
+del /q "%BACKUP%" >NUL 2>&1
+if not exist "%BACKUP%" goto cleanpack
+set /a tries+=1
+if %tries% geq 10 goto cleanpack
+ping -n 2 127.0.0.1 >NUL
+goto dropold_retry
+
+rem 再把安装包与替换过程留下的临时文件清掉，别让 262 MB 的包堆在用户机器上
+:cleanpack
+if not exist "%UPDATEDIR%" goto writelog
+del /q "%UPDATEDIR%\*.part" >NUL 2>&1
+del /q "%UPDATEDIR%\old-pid.txt" >NUL 2>&1
+if /i "%TARGET%"=="%UPDATEDIR%\%TARGETNAME%" goto writelog
+del /q "%UPDATEDIR%\*.exe" >NUL 2>&1
+
+:writelog
+echo [%DATE% %TIME%] 替换完成：旧版本文件与安装包已清理，接下来打开 %TARGETNAME% >>"%LOGFILE%"
+
+rem 打开新版本；起不来就再试两次（旧实例没退干净时新实例会被互斥体挡回去）
+:launch
+set /a tries=0
+:launch_retry
+{launch}
+ping -n 3 127.0.0.1 >NUL
+tasklist /FI "IMAGENAME eq %TARGETNAME%" /NH > "%TEMPFILE%" 2>&1
+find /i "%TARGETNAME%" "%TEMPFILE%" >NUL
+set "RUNNING=%errorlevel%"
+del /q "%TEMPFILE%" >NUL 2>&1
+if "%RUNNING%"=="0" goto bye
+set /a tries+=1
+if %tries% lss 3 goto launch_retry
+echo [%DATE% %TIME%] 已替换成新版本，但没能自动打开，请手动双击 "%TARGET%" >>"%LOGFILE%"
 goto bye
 
 :giveup
-if exist "%TARGET%.old" if not exist "%TARGET%" move /y "%TARGET%.old" "%TARGET%" >NUL 2>&1
+if exist "%BACKUP%" if not exist "%TARGET%" move /y "%BACKUP%" "%TARGET%" >NUL 2>&1
 echo [%DATE% %TIME%] 自动更新失败：没能把 "%SOURCE%" 替换成 "%TARGET%" >>"%LOGFILE%"
 goto bye
 
@@ -311,10 +358,12 @@ def _render_script(
         target=target,
         source=source,
         targetdir=target.parent,
+        targetname=target.name,
+        updatedir=work,
         pid=pid,
         tempfile=work / "old-pid.txt",
-        logfile=work / "update.log",
-        restart='start "" "%TARGET%"' if restart else "rem 本次不自启动",
+        logfile=work / UPDATE_LOG_NAME,
+        launch='start "" /d "%TARGETDIR%" "%TARGET%"' if restart else "goto bye",
     )
 
 
@@ -358,3 +407,98 @@ def apply_update(new_exe: Path, *, restart: bool = True) -> Path:
     logger.info("更新脚本已启动，退出后会自动替换并重启：%s", script)
     time.sleep(0.3)
     return script
+
+
+# ------------------------------------------------------------ 更新后的收尾清理
+@dataclass
+class CleanupReport:
+    """清理结果：给日志和界面提示用，让人能确认旧版本文件真的被删了。"""
+
+    files: list[Path] = field(default_factory=list)
+    freed: int = 0
+
+    def __bool__(self) -> bool:
+        return bool(self.files)
+
+    @property
+    def summary(self) -> str:
+        if not self.files:
+            return ""
+        return (
+            f"更新完成：已清理上一版本文件与安装包"
+            f"（{len(self.files)} 项，{human_size(self.freed)}）"
+        )
+
+
+def _unlink_sized(path: Path) -> int:
+    """删文件并返回释放的字节数；删不掉（还被占用）返回 0，不抛异常。"""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    try:
+        path.unlink()
+    except OSError:
+        logger.debug("清不掉（多半还被占用）：%s", path)
+        return 0
+    return size
+
+
+def _update_in_flight(work: Path) -> bool:
+    """替换脚本还在、而且是刚生成的 → 上一次更新可能正在收尾，别动它的文件。"""
+    try:
+        age = time.time() - (work / UPDATE_SCRIPT_NAME).stat().st_mtime
+    except OSError:
+        return False
+    return age < PENDING_GRACE_SECONDS
+
+
+def cleanup_after_update(
+    *,
+    exe: Path | None = None,
+    workdir: Path | None = None,
+    retry: int = 3,
+) -> CleanupReport:
+    """把自动更新留下的旧版本文件与安装包清掉。程序每次启动都会跑一次。
+
+    两处会留东西：
+
+    * 程序目录里的 `QuarkRelay.exe.old` —— 替换时留下的旧版本备份。替换脚本正常会删，
+      但刚退出的 exe 有时还被资源管理器或杀软占着，删不掉就留在了程序目录里；
+    * `%APPDATA%\\QuarkRelay\\update\\` —— 下载好的安装包（262 MB）、`.part` 半成品、
+      替换脚本、旧进程 PID 临时文件。程序被强杀或替换失败时就会堆在这里。
+
+    正常路径下这两处都是空的（替换脚本自己也会做一遍同样的清理），所以这里是兜底，
+    不会误删用户文件。删除失败不抛异常，下次启动接着删。
+    """
+    report = CleanupReport()
+    work = Path(workdir) if workdir else UPDATE_DIR
+    if _update_in_flight(work):
+        logger.info("上一次更新的替换脚本还在收尾，本次跳过清理")
+        return report
+
+    target = Path(exe) if exe is not None else current_exe()
+    if target is not None:
+        backup = target.with_name(target.name + BACKUP_SUFFIX)
+        for _ in range(max(1, retry)):
+            if not backup.is_file():
+                break
+            freed = _unlink_sized(backup)
+            if not backup.exists():
+                report.files.append(backup)
+                report.freed += freed
+                logger.info("已删除旧版本文件：%s（%s）", backup, human_size(freed))
+                break
+            time.sleep(0.3)
+
+    if work.is_dir():
+        for path in sorted(work.iterdir()):
+            if not path.is_file() or path.name == UPDATE_LOG_NAME:
+                continue
+            freed = _unlink_sized(path)
+            if path.exists():
+                continue
+            report.files.append(path)
+            report.freed += freed
+            logger.info("已清理更新残留：%s（%s）", path, human_size(freed))
+    return report

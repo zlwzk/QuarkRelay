@@ -482,10 +482,17 @@ def test_updater() -> str:
 
     with tempfile.TemporaryDirectory(prefix="qr-update-") as work:
         root = Path(work)
-        target = root / "app.exe"
+        app_dir = root / "app"  # 程序目录与更新目录分开，跟真机上的布局一致
+        app_dir.mkdir()
+        target = app_dir / "app.exe"
         source = root / "new.exe"
         target.write_bytes(b"OLD-BUILD")
         source.write_bytes(b"NEW-BUILD")
+        # 上一版留下的安装包、下到一半的半成品：替换脚本收尾时应该一并清掉
+        stale_package = root / "QuarkRelay.exe"
+        stale_part = root / "QuarkRelay.exe.part"
+        stale_package.write_bytes(b"OLD-PACKAGE" * 100)
+        stale_part.write_bytes(b"HALF")
 
         # 起一个两三秒后自己退出的进程，脚本里的「等 PID 结束」等的就是它
         sleeper = subprocess.Popen(
@@ -521,16 +528,53 @@ def test_updater() -> str:
             f"替换脚本没把新版本放到位，见 {root / 'update.log'}"
         )
         assert not source.exists(), "新版本文件应该已经挪走"
-        assert not (root / "app.exe.old").exists(), "备份文件应该被清掉"
+        assert not (app_dir / "app.exe.old").exists(), "旧版本备份应该被清掉"
         assert not script.exists(), "脚本应该删掉自己"
+        assert not stale_package.exists(), "更新目录里留下的旧安装包应该被清掉"
+        assert not stale_part.exists(), "下到一半的安装包应该被清掉"
+        record = (root / updater.UPDATE_LOG_NAME).read_bytes().decode("mbcs", errors="replace")
+        assert "替换完成" in record, f"替换脚本要留一条成功记录，实际是：{record!r}"
+
+    # 启动时的兜底清理：替换脚本没跑完（被强杀 / 替换失败）时留下的东西由它收拾
+    with tempfile.TemporaryDirectory(prefix="qr-clean-") as work:
+        root = Path(work)
+        app = root / "QuarkRelay.exe"
+        app.write_bytes(b"CURRENT")
+        backup = root / "QuarkRelay.exe.old"  # 上一版替换完没删掉的旧文件
+        backup.write_bytes(b"OLD" * 400)
+        update_dir = root / "update"
+        update_dir.mkdir()
+        package = update_dir / "QuarkRelay.exe"  # 下载好却没装上的安装包
+        package.write_bytes(b"NEW" * 400)
+        part = update_dir / "QuarkRelay.exe.part"  # 下到一半的
+        part.write_bytes(b"HALF")
+        log = update_dir / updater.UPDATE_LOG_NAME
+        log.write_text("留个记录", encoding="utf-8")
+
+        report = updater.cleanup_after_update(exe=app, workdir=update_dir)
+        assert not backup.exists(), "旧版本文件应该被删掉"
+        assert not package.exists() and not part.exists(), "安装包与半成品应该被清掉"
+        assert app.exists(), "当前版本不能被误删"
+        assert log.exists(), "update.log 是记录，不能一起删"
+        assert len(report.files) == 3 and report.freed > 0, report.files
+        assert "项" in report.summary, "清理结果要能直接显示给用户"
+
+        # 替换脚本还在收尾时（刚生成的）不能去动它的文件
+        (update_dir / "apply-update.bat").write_text("@echo off\n", encoding="mbcs")
+        pending = update_dir / "QuarkRelay.exe"
+        pending.write_bytes(b"NEW")
+        assert not updater.cleanup_after_update(exe=app, workdir=update_dir), (
+            "替换脚本还在跑的时候不该清理"
+        )
+        assert pending.exists(), "进行中的更新包不能被删"
 
     # 真连一次 GitHub；断网就当作「离线降级」通过，自检不该因为没网而失败
     info = updater.check(timeout=8)
     if info.error:
         assert info.message.startswith("检查更新失败"), info.message
-        return f"替换脚本跑通，离线降级正常（{info.error[:40]}）"
+        return f"替换脚本与收尾清理跑通，离线降级正常（{info.error[:40]}）"
     return (
-        f"替换脚本跑通 · GitHub 最新版 {info.version or '未知'} / "
+        f"替换脚本与收尾清理跑通 · GitHub 最新版 {info.version or '未知'} / "
         f"本地 v{__version__}：{info.message}"
     )
 

@@ -94,7 +94,8 @@ class AboutPage(Page):
         head.add_layout(row)
 
         self.update_hint = QLabel(
-            "「检查更新」会读取 GitHub 上的最新版本；发现新版本时可以在这里一键下载并自动替换重启。"
+            "「检查更新」会读取 GitHub 上的最新版本；发现新版本时可以在这里一键下载，"
+            "程序重启后会替换成新版本、删掉旧版本文件与下载下来的安装包，然后自动打开新版本。"
         )
         self.update_hint.setObjectName("Muted")
         self.update_hint.setWordWrap(True)
@@ -274,8 +275,8 @@ class AboutPage(Page):
             Toast.show_message(self, text, "error", 5000)
             return
 
-        self.update_hint.setText("更新已就绪，程序会立刻重启完成替换…")
-        Toast.show_message(self, "更新已就绪，正在重启完成安装", "success", 3000)
+        self.update_hint.setText("更新已就绪，程序会立刻重启：替换成新版本、清理旧文件，再自动打开…")
+        Toast.show_message(self, "更新已就绪，正在重启替换并清理旧文件", "success", 3000)
         QTimer.singleShot(1500, self._restart)
 
     def _restart(self) -> None:

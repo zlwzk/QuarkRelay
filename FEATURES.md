@@ -151,6 +151,11 @@
 * 展示新版本号、安装包大小、发布日期与该版本的公告
 * 「立即更新」：后台带进度下载 → 校验（大小 + `MZ` 文件头 + 可选 sha256）→
   生成替换脚本 → 退出后自动替换并重启，全程不用去网页下载
+* 替换完顺手收尾：先删掉旧版本的 exe、再清掉下载下来的安装包（含 `.part` 半成品），
+  然后才打开新版本；新进程没起来会隔几秒重试两次
+* 替换脚本没跑完（程序被强杀）也不留垃圾：下次启动兜底再清一遍，
+  界面上提示「已清理上一版本文件与安装包（几项 / 多大）」
+* `%APPDATA%\QuarkRelay\update\update.log` 里记着每次替换的结果（成功、失败、没打开）
 * 默认启动静默检查；发现新版本且没有任务在跑时自动下载安装（有任务则推迟）
 * 程序目录不可写（如装在 `Program Files`）时自动降级为「去下载页」
 * 断网时只提示「检查更新失败」，绝不阻塞启动
@@ -178,6 +183,6 @@
 | 百度 | 网页版接口：gettemplatevariable / share/verify / share/list / share/transfer / `api/list` / `api/create` / `api/precreate` / `superfile2` / `share/set` |
 | OCR | Windows.Media.Ocr（PowerShell WinRT 桥）|
 | 二维码 | OpenCV QRCodeDetector |
-| 更新 | GitHub Releases API + 校验下载 + 批处理自替换重启 |
+| 更新 | GitHub Releases API + 校验下载 + 批处理自替换（删旧版本 / 清安装包 / 重启） |
 | 存储 | JSON 配置 + SQLite 历史 |
 | 打包 | PyInstaller 单文件 |

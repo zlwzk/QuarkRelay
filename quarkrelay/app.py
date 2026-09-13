@@ -252,7 +252,17 @@ def main(argv: list[str] | None = None) -> int:
     _prepare_windows()
     ensure_dirs()
 
-    from PySide6.QtCore import Qt
+    # 更新后的收尾：上一版留下的 exe 备份、下载下来的安装包都在这里清掉。
+    # 替换脚本正常已经清过一遍，这里是「脚本没跑完（被强杀 / 替换失败）」时的兜底。
+    from .core import updater
+
+    cleanup = updater.CleanupReport()
+    try:
+        cleanup = updater.cleanup_after_update()
+    except Exception:  # noqa: BLE001 - 清理失败绝不能挡住启动
+        logger.exception("清理更新残留失败")
+
+    from PySide6.QtCore import Qt, QTimer
     from PySide6.QtWidgets import QApplication
 
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
@@ -291,6 +301,10 @@ def main(argv: list[str] | None = None) -> int:
     services = AppServices()
     window = MainWindow(services, theme=theme_name)
     window.show()
+
+    if cleanup:
+        logger.info("%s", cleanup.summary)
+        QTimer.singleShot(1200, lambda: services.toast.emit(cleanup.summary, "info"))
 
     code = app.exec()
     services.shutdown()
