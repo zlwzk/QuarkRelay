@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import compileall
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -534,6 +535,18 @@ def test_updater() -> str:
         assert not stale_part.exists(), "下到一半的安装包应该被清掉"
         record = (root / updater.UPDATE_LOG_NAME).read_bytes().decode("mbcs", errors="replace")
         assert "替换完成" in record, f"替换脚本要留一条成功记录，实际是：{record!r}"
+
+        # 替换脚本是模板生成的，静态校验一遍：别把流程跳到不存在的标签上，
+        # 也别把「打开新版本」这一段弄丢（真启动会弹窗，自检里不实际跑这一步）
+        boot = updater._render_script(target, source, 1, restart=True, workdir=root)
+        labels = set(re.findall(r"^:(\w+)", boot, re.M))
+        jumps = set(re.findall(r"goto (\w+)", boot))
+        assert jumps <= labels, f"跳到了不存在的标签：{sorted(jumps - labels)}"
+        assert 'start "" /d "%TARGETDIR%" "%TARGET%"' in boot, "要打开新版本"
+        assert "IMAGENAME eq %TARGETNAME%" in boot, "打开之后要确认进程真的起来了"
+        assert "没能自动打开" in boot, "起不来要留下一条记录"
+        quiet = updater._render_script(target, source, 1, restart=False, workdir=root)
+        assert "goto bye" in quiet and '\nstart ""' not in quiet, "不重启时不该打开程序"
 
     # 启动时的兜底清理：替换脚本没跑完（被强杀 / 替换失败）时留下的东西由它收拾
     with tempfile.TemporaryDirectory(prefix="qr-clean-") as work:
