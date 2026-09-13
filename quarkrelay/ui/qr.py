@@ -367,7 +367,7 @@ class QrWatcher(QObject):
         if not info.get("found"):
             self._misses += 1
             if self._misses >= self.MISS_LIMIT:
-                self._panel.set_note("页面里没找到二维码：多半是浏览器里已经登录了，直接在右边操作即可")
+                self._panel.set_note("登录页里没找到二维码：多半是已经登录过了，点「显示登录页」看一眼")
             return
         self._misses = 0
         sig = str(info.get("sig") or "")
@@ -387,6 +387,6 @@ class QrWatcher(QObject):
         target = max(self._panel.canvas.width(), 160)
         image = image_from_payload(payload, target)
         if image is None:
-            self._panel.set_note("二维码取到了但没解析成功，可直接在右侧页面里扫")
+            self._panel.set_note("二维码取到了但没解析成功，点「显示登录页」直接在页面里扫")
             return
-        self._panel.set_image(image, "与右侧页面里是同一枚二维码，扫这枚更清楚")
+        self._panel.set_image(image, "与登录页里是同一枚二维码，扫这枚更清楚")

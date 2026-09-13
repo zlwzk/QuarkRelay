@@ -35,6 +35,8 @@ logger = logging.getLogger(__name__)
 PAN = "https://pan.baidu.com"
 PCS = "https://d.pcs.baidu.com"
 APP_ID = "250528"
+# 会话 Cookie 统一挂在这个域上：它覆盖 baidu.com 本身与 pan / passport / pcs 等全部子域
+BAIDU_COOKIE_DOMAIN = ".baidu.com"
 SLICE_SIZE = 4 * 1024 * 1024  # 百度网页端就是按 4MB 分片上传的
 SHARE_PWD_CHARS = "abcdefghijkmnpqrstuvwxyz23456789"
 DEFAULT_UA = (
@@ -120,6 +122,13 @@ class BaiduClient:
 
     # ------------------------------------------------------------- 会话管理
     def set_cookies(self, cookies: str) -> None:
+        """把 `k=v; k=v` 这样的串装进会话。
+
+        只能挂到一个域上：同一个名字挂到多个域时，requests 读
+        `session.cookies.get("BDUSS")` 会抛 CookieConflictError，
+        于是「扫完码却说未登录」。`.baidu.com` 这个域本身就能覆盖
+        pan / passport / pcs 等所有子域，挂一次就够。
+        """
         self.session.cookies.clear()
         for part in re.split(r"[;\n]", cookies or ""):
             part = part.strip()
@@ -130,9 +139,7 @@ class BaiduClient:
             value = value.strip()
             if not key:
                 continue
-            self.session.cookies.set(key, value, domain=".baidu.com")
-            self.session.cookies.set(key, value, domain="pan.baidu.com")
-            self.session.cookies.set(key, value, domain=".pan.baidu.com")
+            self.session.cookies.set(key, value, domain=BAIDU_COOKIE_DOMAIN)
 
     def export_cookies(self) -> str:
         seen: dict[str, str] = {}
@@ -141,13 +148,23 @@ class BaiduClient:
                 seen[cookie.name] = cookie.value
         return "; ".join(f"{k}={v}" for k, v in seen.items())
 
+    def _cookie(self, name: str) -> str:
+        """读一个 cookie 的值；万一撞名也返回一个而不是直接炸掉。"""
+        try:
+            return self.session.cookies.get(name) or ""
+        except Exception:  # noqa: BLE001 - CookieConflictError
+            for cookie in self.session.cookies:
+                if cookie.name == name and cookie.value:
+                    return cookie.value
+            return ""
+
     @property
     def logged_in(self) -> bool:
-        return bool(self.session.cookies.get("BDUSS")) or bool(self.bdstoken)
+        return bool(self._cookie("BDUSS")) or bool(self.bdstoken)
 
     def verify(self, *, deep: bool = True) -> dict[str, Any]:
         """校验会话并拉取 bdstoken / uk。"""
-        if not self.session.cookies.get("BDUSS"):
+        if not self._cookie("BDUSS"):
             raise BaiduAuthError("尚未登录百度网盘")
         fields = '["bdstoken","token","uk","isdocuser","servertime"]'
         try:

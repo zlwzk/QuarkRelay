@@ -3,9 +3,11 @@
 设计要点
 * 使用 QtWebEngine 的**命名持久化 Profile**，cookie 存在 %APPDATA%\\QuarkRelay\\webengine
   下，与系统浏览器完全隔离，不会影响你平时上网的登录状态。
-* 用 `QWebEngineCookieStore.loadAllCookies()` 读取全部 cookie —— 包括 HttpOnly 的
-  BDUSS / STOKEN，这些用 JS 的 document.cookie 是拿不到的。这也是选择 QtWebEngine
-  而不是普通 WebView 的最主要原因。
+* 关键 cookie（BDUSS / STOKEN）是 HttpOnly 的，JS 的 document.cookie 拿不到，所以会话
+  靠两条路一起取：对话框全程订着 `cookieAdded`（页面新写的 cookie 立刻到手，HttpOnly 也一样），
+  再直接读一次 Profile 的 cookie 库垫底。**不能用 `loadAllCookies()`**：Qt 6.11 上实测
+  它一条都回不出来（库里有 40 条、其中就有 BDUSS，回调却是空的），
+  这正是「扫码登录明明成功了却一直显示未登录」的根因之一。
 * 百度下载直链由百度前端私有签名生成，本程序不逆向；而是让页面自己去请求下载，
   我们从 `QWebEngineProfile.downloadRequested` 里截获真实直链，再用同一套 cookie
   在后台流式读取数据（不落到桌面上）。
@@ -14,9 +16,11 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 from PySide6.QtCore import QEventLoop, QObject, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QGuiApplication
@@ -69,13 +73,75 @@ def profile(name: str) -> QWebEngineProfile:
     return prof
 
 
-class CookieJar(QObject):
-    """一次性收集 Profile 里的全部 cookie（含 HttpOnly 的那些）。
+def _cookie_db_path(prof: QWebEngineProfile) -> Path | None:
+    """内置浏览器的 cookie 库在哪。"""
+    try:
+        root = Path(prof.persistentStoragePath())
+    except Exception:  # noqa: BLE001
+        return None
+    # 老版本 Chromium 把库放在 Profile 根目录，新版本挪进了 Network 子目录
+    for relative in ("Network/Cookies", "Cookies"):
+        path = root / relative
+        if path.is_file():
+            return path
+    return None
 
-    `loadAllCookies()` 只提供「逐个 cookieAdded」回调，没有「加载完成」信号。
-    之前固定 sleep 一段时间的写法，cookie 一多就会漏读 —— 登录信息读取不到位
-    就是这么来的。这里改成**等到回调流静默下来**为止：
-    至少等 min_ms，连续 quiet_ms 没有新 cookie 就收工，最多不超过 max_ms。
+
+def read_persisted_cookies(prof: QWebEngineProfile) -> dict[str, dict[str, str]]:
+    """直接读一次 Profile 的 cookie 库，返回 {域名: {名字: 值}}。
+
+    只用它垫底：读不到（库被占用、字段变了、还没生成）就返回空字典，绝不抛异常。
+    本机 Qt 把 cookie 的 value 列存成明文，所以不需要做任何解密。
+    """
+    path = _cookie_db_path(prof)
+    if path is None:
+        return {}
+    # Chromium 的时间戳是「1601-01-01 起的微秒」
+    now_us = int((time.time() + 11644473600) * 1_000_000)
+    sql = (
+        "select host_key, name, value from cookies"
+        " where value != '' and (has_expires = 0 or expires_utc > ?)"
+    )
+    rows: list[tuple[object, object, object]] = []
+    for attempt in range(3):
+        try:
+            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.6)
+            try:
+                rows = list(con.execute(sql, (now_us,)))
+            finally:
+                con.close()
+            break
+        except sqlite3.Error as exc:
+            logger.debug("读 cookie 库失败（第 %s 次）：%s", attempt + 1, exc)
+            if attempt == 2:
+                return {}
+            time.sleep(0.1)
+
+    cookies: dict[str, dict[str, str]] = {}
+    for host, name, value in rows:
+        name, value = str(name or ""), str(value or "")
+        if not name or not value:
+            continue
+        cookies.setdefault(str(host or "").lstrip(".").lower(), {})[name] = value
+    return cookies
+
+
+def clear_profile_cookies(prof: QWebEngineProfile) -> None:
+    """清空某个 Profile 的 cookie（会话已失效时用，好让下次能重新扫码登录）。"""
+    try:
+        prof.cookieStore().deleteAllCookies()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("清空 cookie 失败：%s", exc)
+
+
+class CookieJar(QObject):
+    """收集 Profile 里的 cookie（含 HttpOnly 的那些）。
+
+    两条来源合起来用：
+      * 常驻订 `cookieAdded`：页面刚写下的 cookie 立刻到手，扫码登录全靠它；
+      * 构造时直接读一次 cookie 库：冷启动时那些**已经躺在库里**的 cookie
+        不会走回调（`loadAllCookies()` 在 Qt 6.11 上一条都不回），不垫这一层
+        就会出现「库里明明有 BDUSS，程序却说没登录」。
     """
 
     def __init__(self, prof: QWebEngineProfile, parent: QObject | None = None) -> None:
@@ -86,6 +152,11 @@ class CookieJar(QObject):
         self._last_seen = 0.0
         self._store = prof.cookieStore()
         self._store.cookieAdded.connect(self._on_added)
+        # 域名从「粗」到「细」垫底，细的（pan.baidu.com）覆盖粗的（baidu.com）
+        seeded = read_persisted_cookies(prof)
+        for domain in sorted(seeded, key=lambda item: item.count(".")):
+            self._cookies.update(seeded[domain])
+            self._by_domain.setdefault(domain, {}).update(seeded[domain])
 
     @staticmethod
     def _decode(raw: object) -> str:
@@ -113,9 +184,11 @@ class CookieJar(QObject):
         self._last_seen = time.monotonic()
 
     def collect(self, min_ms: int = 700, quiet_ms: int = 400, max_ms: int = 8000) -> dict[str, str]:
+        """等回调流静默下来再收工：至少 min_ms，连续 quiet_ms 没新 cookie 就走，最多 max_ms。"""
         loop = QEventLoop()
         started = time.monotonic()
         self._last_seen = started
+        # 该调用的实现在新版 Qt 上不回任何东西，留着只是照顾老版本 —— 别指望它
         self._store.loadAllCookies()
 
         poll = QTimer(self)
@@ -142,12 +215,13 @@ class CookieJar(QObject):
         """按域名取 cookie。
 
         同名 cookie（比如 `BDUSS`）在不同域下可能值不同，合在一起会互相覆盖，
-        所以建会话时要按域名挑。
+        所以建会话时要按域名挑。同一层级的冲突按「域名越具体越优先」来定，
+        免得 `STOKEN` 取成 passport 那一份而不是 pan 那一份。
         """
         merged: dict[str, str] = {}
-        for domain, items in self._by_domain.items():
+        for domain in sorted(self._by_domain, key=lambda item: item.count(".")):
             if any(domain == s or domain.endswith("." + s) for s in domain_suffixes):
-                merged.update(items)
+                merged.update(self._by_domain[domain])
         return merged
 
     @property
@@ -190,8 +264,8 @@ class WebLoginDialog(QDialog):
     """内置浏览器登录窗口。
 
     autodetect 返回 True 时视为登录成功，窗口会自动关闭并回传 cookie。
-    传入 qr_hint 时，左边会多一块「放大后的二维码」—— 页面里的那枚太小、
-    还常被浮层压着，抠出来单独摆着扫起来省事。
+    传入 qr_hint 时窗口里**只摆那枚放大后的二维码**（页面里的那枚太小、还常被
+    浮层压着）；登录页默认收起来，需要时点「显示登录页」再展开。
     """
 
     def __init__(
@@ -210,6 +284,7 @@ class WebLoginDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
+        self._base_size = size
         self.resize(*self._fit_size(size, qr_hint))
         self.setModal(True)
         self.cookies: dict[str, str] = {}
@@ -218,12 +293,15 @@ class WebLoginDialog(QDialog):
         self._detected = False
         self.await_result: Callable[[], tuple[bool, str]] | None = None
         self._await_timer: QTimer | None = None
-        self.jar: CookieJar | None = None
+        self._body: QHBoxLayout | None = None
+        self.page_btn: QPushButton | None = None
 
         self.prof = profile(profile_name)
         self.page = QWebEnginePage(self.prof, self)
         self.view = QWebEngineView(self)
         self.view.setPage(self.page)
+        # 全程订着 cookie：页面一写进来就到手，扫码登录不必轮着翻库
+        self.jar: CookieJar = CookieJar(self.prof, self)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 12, 14, 12)
@@ -243,12 +321,19 @@ class WebLoginDialog(QDialog):
         self.qr_panel: QrPanel | None = None
         self.qr_watcher: QrWatcher | None = None
         if qr_hint:
+            # 只摆二维码，两边各留一条等长的空白 → 二维码正好居中。
+            # 登录页**不进布局**：布局里的隐藏控件会被算成 0 尺寸，页面照 0 宽排版，
+            # 二维码就抠不出来了。所以给它一个真实尺寸，单独藏着。
             body = QHBoxLayout()
             body.setSpacing(14)
+            body.addStretch(1)
             self.qr_panel = QrPanel(qr_hint, self, on_refresh=self._refresh_qr)
             body.addWidget(self.qr_panel, 0, Qt.AlignmentFlag.AlignTop)
-            body.addWidget(self.view, 1)
+            body.addStretch(1)
             layout.addLayout(body, 1)
+            self._body = body
+            self.view.resize(1100, 800)
+            self.view.hide()
             self.qr_watcher = QrWatcher(self.page, self.qr_panel, self)
         else:
             layout.addWidget(self.view, 1)
@@ -258,6 +343,11 @@ class WebLoginDialog(QDialog):
         self.status = QLabel("正在加载…")
         self.status.setObjectName("Muted")
         footer.addWidget(self.status, 1)
+        if self.qr_panel is not None:
+            self.page_btn = QPushButton("显示登录页")
+            self.page_btn.setObjectName("Ghost")
+            self.page_btn.clicked.connect(self._toggle_page)
+            footer.addWidget(self.page_btn)
         reload_btn = QPushButton("重新加载")
         reload_btn.setObjectName("Ghost")
         reload_btn.clicked.connect(lambda: self.view.reload())
@@ -289,18 +379,44 @@ class WebLoginDialog(QDialog):
             self._timer = None
 
     @staticmethod
-    def _fit_size(size: tuple[int, int], qr_hint: str | None) -> tuple[int, int]:
-        """带二维码面板的窗口要宽一点，但不能顶出屏幕外。"""
+    def _fit_size(
+        size: tuple[int, int], qr_hint: str | None, page_visible: bool = True
+    ) -> tuple[int, int]:
+        """窗口要装得下二维码卡片；连着登录页一起看时再宽一点。
+
+        但都别顶出屏幕：屏幕小的时候以可用区为准。
+        """
         width, height = size
         if qr_hint:
-            # 左边让给二维码面板，右边给登录页留够宽度（登录页本身就是窄表单）
-            width = CARD_SIZE + 24 + max(720, width - 260)
+            if page_visible:
+                # 左边让给二维码卡片，右边给登录页留够宽度（登录页本身就是窄表单）
+                width = CARD_SIZE + 24 + max(720, width - 260)
+            else:
+                width = CARD_SIZE + 140
+                height = min(height, 780)
         screen = QGuiApplication.primaryScreen()
         if screen is not None:
             room = screen.availableGeometry()
             width = min(width, room.width() - 60)
             height = min(height, room.height() - 60)
-        return max(720, width), max(520, height)
+        return max(520 if qr_hint else 720, width), max(520, height)
+
+    def _toggle_page(self) -> None:
+        """「只看二维码」⇄「连着登录页一起看」。"""
+        if self.view.isVisible():
+            self.view.hide()
+            if self._body is not None:
+                self._body.removeWidget(self.view)
+            if self.page_btn is not None:
+                self.page_btn.setText("显示登录页")
+            self.resize(*self._fit_size(self._base_size, "qr", False))
+        else:
+            if self._body is not None:
+                self._body.addWidget(self.view, 1)
+            self.view.show()
+            if self.page_btn is not None:
+                self.page_btn.setText("只看二维码")
+            self.resize(*self._fit_size(self._base_size, "qr", True))
 
     def _refresh_qr(self) -> None:
         if self.qr_watcher is not None:
@@ -342,21 +458,12 @@ class WebLoginDialog(QDialog):
             self.accept()
 
     def _check(self, manual: bool = False) -> None:
-        # 轮询期间只做快速探测（cookie 已经在 Profile 里，回调来得很快），
-        # 别每次都等满静默窗口，否则界面会一顿一顿的。
-        try:
-            cookies = read_cookies(
-                self.prof,
-                min_ms=180,
-                quiet_ms=150,
-                max_ms=1500 if manual else 900,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("读取 cookie 失败：%s", exc)
-            return
+        # cookie 由常驻的 jar 全程收着，这里只取一份快照 —— 不再每次都去翻库
+        # （翻库那一下要把事件循环停住，界面会一顿一顿的）。
+        cookies = self.jar.cookies
         if not cookies:
             if manual:
-                self.status.setText("还没读到登录信息，请在页面里完成登录")
+                self.status.setText("还没读到登录信息，请在手机 App 里完成扫码")
             return
         self.cookies = cookies
         if self._autodetect and self._autodetect(cookies):
@@ -365,20 +472,13 @@ class WebLoginDialog(QDialog):
                 self.status.setText("已检测到登录状态，正在完成…")
                 QTimer.singleShot(400, self._finish)
         elif manual:
-            self.status.setText("已读取到会话信息")
+            self.status.setText("已读到会话信息，点「完成登录」继续")
 
     def _finish(self) -> None:
         if self._timer:
             self._timer.stop()
-        try:
-            # 收工前读一次完整的：等回调流真正静默下来，HttpOnly 的
-            # BDUSS / STOKEN 这类关键 cookie 才不会漏；同时留下带域名的
-            # jar，调用方可以只取某个域名下的 cookie。
-            self.jar = read_cookie_jar(self.prof, min_ms=800, quiet_ms=450, max_ms=8000)
-            if self.jar.cookies:
-                self.cookies = self.jar.cookies
-        except Exception:  # noqa: BLE001
-            pass
+        if self.jar.cookies:
+            self.cookies = self.jar.cookies
         if self._autodetect and self.cookies and not self._autodetect(self.cookies):
             keep = self.status.text()
             self.status.setText("似乎还没登录成功，再试一次？（" + keep + "）")

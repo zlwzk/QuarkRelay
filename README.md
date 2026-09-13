@@ -2,7 +2,7 @@
 
 把「别人的网盘链接」变成「你自己的分享链接」。
 
-**当前版本：v1.1.1** · Windows 10/11 · 单文件 exe，免安装
+**当前版本：v1.1.2** · Windows 10/11 · 单文件 exe，免安装
 
 ---
 
@@ -81,12 +81,14 @@ QuarkRelay 要做的事情很简单：
 ## 登录是怎么做的（不会影响你平时上网）
 
 * 两个网盘的登录**都在程序内置的浏览器窗口里完成**，支持扫码
-* 登录窗口左边会把页面上那枚二维码**单独抠出来放大展示**（白底卡片 + 静区，好扫），
-  它和右边网页里是同一枚，页面换码会自动跟着更新，也能手动点「刷新二维码」
+* 登录窗口里**只摆一枚二维码**：从登录页抠出来、放大、补上白边（静区）后居中展示，
+  页面换码会自动跟着更新，也能手动点「刷新二维码」；
+  想自己看/操作登录页时，点「显示登录页」再展开
 * 使用 QtWebEngine 的**命名持久化 Profile**，Cookie 存在
   `%APPDATA%\QuarkRelay\webengine\` 下，和你的系统浏览器（Chrome/Edge）**完全隔离**
-* 读取 Cookie 用的是 `QWebEngineCookieStore.loadAllCookies()`，能拿到
-  `BDUSS` / `STOKEN` 这类 **HttpOnly** Cookie（这正是普通 JS 注入拿不到的部分）
+* 读取 Cookie 走两条路：全程监听 `cookieAdded` + 直接读一次 Profile 的 Cookie 库，
+  这样 `BDUSS` / `STOKEN` 这类 **HttpOnly** Cookie（普通 JS 注入拿不到的部分）
+  在冷启动时也不会漏 —— 只靠 `loadAllCookies()` 在部分 Qt 版本上会一条都读不到
 * **夸克**走的是夸克网盘开放平台的**授权码流程**（OAuth），授权成功后只保存
   access_token / refresh_token，令牌过期会自动刷新
 * 卸载／忘记密码都不影响：设置页有「清除全部登录凭据」一键清空

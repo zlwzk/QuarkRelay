@@ -376,7 +376,75 @@ def test_qr_panel() -> str:
     assert page.grabs == 1, "签名没变却又取了一次图"
     assert qr._loads("这不是 JSON") is None  # noqa: SLF001 - 回调可能拿到空串/脏数据
 
-    return f"位图 {side}px / 矢量 {vector.width()}px / 卡片 {qr.CARD_SIZE}px（含静区）"
+    # 5) 窗口尺寸：只看二维码时收窄到刚装得下卡片，展开登录页时才变宽
+    from quarkrelay.ui.browser import WebLoginDialog
+
+    narrow = WebLoginDialog._fit_size((1100, 720), "扫码", False)[0]  # noqa: SLF001
+    wide = WebLoginDialog._fit_size((1100, 720), "扫码", True)[0]  # noqa: SLF001
+    assert narrow < wide, (narrow, wide)
+    assert narrow >= qr.CARD_SIZE + 100, narrow
+
+    return (
+        f"位图 {side}px / 矢量 {vector.width()}px / 卡片 {qr.CARD_SIZE}px（含静区）"
+        f" / 窗口 {narrow}→{wide}px"
+    )
+
+
+@check("登录会话：cookie 库读取与同名冲突")
+def test_login_session() -> str:
+    import sqlite3
+
+    from quarkrelay.core.baidu import BaiduClient
+    from quarkrelay.ui.browser import cookie_string, read_persisted_cookies
+
+    # 1) 同名 cookie 挂到多个域时，requests 读 `cookies.get("BDUSS")` 会抛
+    #    CookieConflictError —— 表现就是「扫完码却说未登录」。必须只挂一个域。
+    client = BaiduClient(cookies="BDUSS=fake-bduss; STOKEN=fake-stoken; BAIDUID=x")
+    assert client.logged_in, "带 BDUSS 的会话应当算作已登录"
+    assert client.export_cookies().count("BDUSS=") == 1
+    assert {c.domain for c in client.session.cookies} == {".baidu.com"}
+    assert client._cookie("BDUSS") == "fake-bduss"  # noqa: SLF001
+
+    # 2) cookie 库要读得出来：`loadAllCookies()` 在新版 Qt 上一条都不回，
+    #    冷启动时就靠这一手把已经躺在库里的会话捡回来。
+    root = Path(tempfile.mkdtemp(prefix="qrck-"))
+    try:
+        now_us = int((time.time() + 11644473600) * 1_000_000)  # Chromium 纪元
+        con = sqlite3.connect(root / "Cookies")
+        con.execute(
+            "create table cookies"
+            " (host_key text, name text, value text, has_expires int, expires_utc int)"
+        )
+        con.executemany(
+            "insert into cookies values (?,?,?,?,?)",
+            [
+                (".baidu.com", "BDUSS", "bduss-root", 0, 0),
+                ("pan.baidu.com", "STOKEN", "stoken-pan", 1, now_us + 3600 * 10**6),
+                (".baidu.com", "STOKEN", "stoken-root", 0, 0),
+                (".baidu.com", "DEAD", "gone", 1, now_us - 3600 * 10**6),
+                (".baidu.com", "EMPTY", "", 0, 0),
+            ],
+        )
+        con.commit()
+        con.close()
+
+        class StubProfile:
+            def persistentStoragePath(self) -> str:  # noqa: N802
+                return str(root)
+
+        got = read_persisted_cookies(StubProfile())  # type: ignore[arg-type]
+        assert got["baidu.com"]["BDUSS"] == "bduss-root", got
+        assert got["pan.baidu.com"]["STOKEN"] == "stoken-pan", got
+        assert "DEAD" not in got["baidu.com"], "过期 cookie 不该被读出来"
+        assert "EMPTY" not in got["baidu.com"], "空值 cookie 不该被读出来"
+
+        # 3) 读不出来时要安静地退化，不能把登录流程带崩
+        assert read_persisted_cookies(StubProfile()) is not None  # type: ignore[arg-type]
+        assert cookie_string({"BDUSS": "x"}, ("BDUSS",)) == "BDUSS=x"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    return f"域名 {sorted(got)} · 同名 cookie 只挂一个域"
 
 
 @check("检查更新：版本比较与降级路径")
@@ -489,6 +557,7 @@ def main(argv: list[str]) -> int:
         test_config,
         test_store,
         test_tasks,
+        test_login_session,
         test_updater,
     ]
     if "--no-ui" not in argv:
