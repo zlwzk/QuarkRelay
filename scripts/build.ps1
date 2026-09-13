@@ -85,6 +85,8 @@ $ArgsList = @(
     '--icon', (Join-Path $Root 'build\app.ico'),
     '--hidden-import', 'PySide6.QtWebEngineWidgets',
     '--hidden-import', 'PySide6.QtWebEngineCore',
+    # 夸克的登录二维码是 <svg>，本地光栅化要用它（代码里是延迟导入，怕收拾不干净）
+    '--hidden-import', 'PySide6.QtSvg',
     '--hidden-import', 'PySide6.QtNetwork'
 ) + ($Excludes | ForEach-Object { '--exclude-module'; $_ }) + @((Join-Path $Root 'main.py'))
 
@@ -121,6 +123,7 @@ if ($Code -ne 0) {
     Write-Warning "exe 退出码是 $Code（报告显示一切正常，通常是窗口化程序没有控制台导致的，可忽略）"
 }
 
-Write-Host ("自检通过：Python {0}，{1} 个页面，内置浏览器 {2}" -f `
-    $SelfCheck.python, $SelfCheck.checks.pages, $SelfCheck.checks.webengine) -ForegroundColor Green
+Write-Host ("自检通过：Python {0}，{1} 个页面，内置浏览器 {2}，登录二维码 {3}" -f `
+    $SelfCheck.python, $SelfCheck.checks.pages, $SelfCheck.checks.webengine, `
+    $SelfCheck.checks.qr_panel) -ForegroundColor Green
 Write-Host "版本号 v$Version 校验通过。" -ForegroundColor Green

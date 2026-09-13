@@ -194,10 +194,31 @@ def self_check() -> int:
     except Exception as exc:  # noqa: BLE001
         problems.append(f"内置浏览器初始化失败：{exc}")
 
+    # 登录二维码面板：渲染一枚 SVG 再贴到白底卡片上。
+    # 顺带守住 PySide6.QtSvg —— 夸克的二维码是矢量的，这个模块没被 PyInstaller
+    # 收进来的话，用户只会看到「二维码取到了但没解析成功」，很难查。
+    try:
+        from .ui.qr import CARD_SIZE, card_pixmap, image_from_payload
+
+        svg = (
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 21 21">'
+            '<rect width="21" height="21" fill="#ffffff"/>'
+            '<rect width="7" height="7" fill="#000000"/>'
+            "</svg>"
+        )
+        painted = image_from_payload({"kind": "svg", "value": svg}, CARD_SIZE)
+        if painted is None:
+            problems.append("二维码 SVG 渲染失败（PySide6.QtSvg 可能没打包进来）")
+        elif card_pixmap(painted, CARD_SIZE, 1.0).width() != CARD_SIZE:
+            problems.append("二维码卡片尺寸不对")
+        else:
+            checks["qr_panel"] = f"svg {painted.width()}px → 卡片 {CARD_SIZE}px"
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"二维码面板初始化失败：{exc}")
+
     noisy = [m for m in qt_messages if "WebEngine" in m or "webengine" in m]
     if noisy:
         checks["qt_messages"] = noisy[:5]
-
     report["ok"] = not problems
     text = json.dumps(report, ensure_ascii=False, indent=2)
     try:

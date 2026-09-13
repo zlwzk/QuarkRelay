@@ -132,13 +132,14 @@ class AppServices(QObject):
 
         dialog = WebLoginDialog(
             "登录夸克网盘",
-            "在下方页面用夸克 App 扫码或账号登录并同意授权。授权结果由后台自动确认，"
-            "成功后会立即关闭本窗口；登录数据只保存在本机 %APPDATA%\\QuarkRelay，"
-            "不影响系统浏览器里的登录状态。",
+            "左边是授权页里的同一枚二维码，直接用夸克 App 扫它就行。"
+            "授权结果由后台自动确认，成功后会立即关闭本窗口；登录数据只保存在本机 "
+            "%APPDATA%\\QuarkRelay，不影响系统浏览器里的登录状态。",
             info["authorize_page_url"],
             "quark",
             done_text="我已授权完成",
             parent=parent,
+            qr_hint="用夸克 App 扫码授权",
         )
 
         box: dict[str, Any] = {}
@@ -194,15 +195,19 @@ class AppServices(QObject):
         return False
 
     def login_baidu(self, parent=None) -> bool:
+        # 直接进 passport 的扫码页：以前落在网盘首页，还得自己找「登录」按钮，
+        # 弹出来的登录框里二维码又小又居右，扫起来别扭。
         dialog = WebLoginDialog(
             "登录百度网盘",
-            "在下方页面登录你的百度网盘账号（支持扫码）。检测到登录后窗口会自动关闭。"
-            "会话 Cookie 只保存在本机，不会写入系统浏览器，也不影响你正常使用百度网盘。",
-            "https://pan.baidu.com/",
+            "左边是百度登录页里的同一枚二维码，用百度 App 扫它就行。"
+            "检测到登录后窗口会自动关闭。会话 Cookie 只保存在本机，不会写入系统浏览器，"
+            "也不影响你正常使用百度网盘。",
+            "https://passport.baidu.com/v2/?login&tpl=netdisk&u=https%3A%2F%2Fpan.baidu.com%2Fdisk%2Fmain",
             "baidu",
             autodetect=lambda cookies: bool(cookies.get("BDUSS")),
             cookie_keys=BAIDU_KEYS,
             parent=parent,
+            qr_hint="用百度 App 扫码登录",
         )
         if dialog.exec() != dialog.DialogCode.Accepted:
             return False

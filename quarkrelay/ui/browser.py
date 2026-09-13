@@ -19,6 +19,7 @@ import time
 from collections.abc import Callable
 
 from PySide6.QtCore import QEventLoop, QObject, QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtNetwork import QNetworkCookie
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -33,6 +34,7 @@ from PySide6.QtWidgets import (
 
 from ..core.errors import BaiduError
 from ..paths import WEB_DIR, ensure_dirs
+from .qr import CARD_SIZE, QrPanel, QrWatcher
 from .widgets import Toast
 
 logger = logging.getLogger(__name__)
@@ -188,6 +190,8 @@ class WebLoginDialog(QDialog):
     """内置浏览器登录窗口。
 
     autodetect 返回 True 时视为登录成功，窗口会自动关闭并回传 cookie。
+    传入 qr_hint 时，左边会多一块「放大后的二维码」—— 页面里的那枚太小、
+    还常被浮层压着，抠出来单独摆着扫起来省事。
     """
 
     def __init__(
@@ -202,10 +206,11 @@ class WebLoginDialog(QDialog):
         cookie_keys: list[str] | None = None,
         parent: QWidget | None = None,
         size: tuple[int, int] = (980, 720),
+        qr_hint: str | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(*size)
+        self.resize(*self._fit_size(size, qr_hint))
         self.setModal(True)
         self.cookies: dict[str, str] = {}
         self.cookie_keys = cookie_keys
@@ -235,7 +240,18 @@ class WebLoginDialog(QDialog):
         head.addWidget(sub)
         layout.addLayout(head)
 
-        layout.addWidget(self.view, 1)
+        self.qr_panel: QrPanel | None = None
+        self.qr_watcher: QrWatcher | None = None
+        if qr_hint:
+            body = QHBoxLayout()
+            body.setSpacing(14)
+            self.qr_panel = QrPanel(qr_hint, self, on_refresh=self._refresh_qr)
+            body.addWidget(self.qr_panel, 0, Qt.AlignmentFlag.AlignTop)
+            body.addWidget(self.view, 1)
+            layout.addLayout(body, 1)
+            self.qr_watcher = QrWatcher(self.page, self.qr_panel, self)
+        else:
+            layout.addWidget(self.view, 1)
 
         footer = QHBoxLayout()
         footer.setSpacing(8)
@@ -259,6 +275,8 @@ class WebLoginDialog(QDialog):
         footer.addWidget(self.done_btn)
         layout.addLayout(footer)
 
+        if self.qr_watcher is not None:
+            self.qr_watcher.start()
         self.view.loadFinished.connect(self._on_loaded)
         self.view.load(QUrl(url))
 
@@ -269,6 +287,24 @@ class WebLoginDialog(QDialog):
             self._timer.start()
         else:
             self._timer = None
+
+    @staticmethod
+    def _fit_size(size: tuple[int, int], qr_hint: str | None) -> tuple[int, int]:
+        """带二维码面板的窗口要宽一点，但不能顶出屏幕外。"""
+        width, height = size
+        if qr_hint:
+            # 左边让给二维码面板，右边给登录页留够宽度（登录页本身就是窄表单）
+            width = CARD_SIZE + 24 + max(720, width - 260)
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            room = screen.availableGeometry()
+            width = min(width, room.width() - 60)
+            height = min(height, room.height() - 60)
+        return max(720, width), max(520, height)
+
+    def _refresh_qr(self) -> None:
+        if self.qr_watcher is not None:
+            self.qr_watcher.refresh()
 
     def _on_loaded(self, ok: bool) -> None:
         self.status.setText("页面已加载，请完成登录/授权" if ok else "页面加载失败，可点「重新加载」")

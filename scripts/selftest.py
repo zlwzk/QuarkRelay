@@ -291,6 +291,94 @@ def test_ui() -> str:
     return f"{len(pages)} 个页面已装配，双向搬运与截图按钮就位"
 
 
+@check("登录二维码：抠图 → 静区 → 放大面板")
+def test_qr_panel() -> str:
+    import base64
+    import json
+
+    from PySide6.QtCore import QBuffer, QIODevice, QObject
+    from PySide6.QtGui import QColor, QImage
+
+    from quarkrelay.ui import qr
+
+    # 造一枚「二维码」：黑白棋盘格，而且像真二维码一样紧贴边缘、不留静区。
+    # 夸克和百度两家的二维码都是这么生成的，也正是直接截图扫不出来的原因。
+    side = 25
+    source = QImage(side, side, QImage.Format.Format_RGB32)
+    for y in range(side):
+        for x in range(side):
+            tone = 255 if (x + y) % 2 == 0 else 0
+            source.setPixelColor(x, y, QColor(tone, tone, tone))
+
+    def data_url(image: QImage) -> str:
+        buffer = QBuffer()
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        assert image.save(buffer, "PNG"), "测试用 PNG 生成失败"
+        return "data:image/png;base64," + base64.b64encode(bytes(buffer.data())).decode("ascii")
+
+    # 1) 位图：百度是 <img>，页面里经 canvas 转成 dataURL 交回来
+    raster = qr.image_from_payload({"kind": "img", "value": data_url(source)}, 400)
+    assert raster is not None, "dataURL 解码失败"
+    assert raster.width() == side, raster.width()
+
+    # 2) 矢量：夸克是 <svg>，由本地按目标尺寸光栅化（QtSvg 不能少）
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 21 21">'
+        '<rect width="21" height="21" fill="#ffffff"/>'
+        '<rect width="7" height="7" fill="#000000"/>'
+        "</svg>"
+    )
+    vector = qr.image_from_payload({"kind": "svg", "value": svg}, 200)
+    assert vector is not None, "SVG 渲染失败（QtSvg 没装上？）"
+    assert vector.width() == 200 * qr.OVERSAMPLE, vector.width()
+
+    # 3) 卡片：白底 + 四周静区。少了静区，正规扫码器会认不出来
+    board = qr.card_pixmap(raster, 200, 1.0).toImage()
+    assert (board.width(), board.height()) == (200, 200), board.size()
+    margin = int(200 * qr.QUIET_RATIO) - 1
+    for point in ((0, 0), (199, 0), (0, 199), (199, 199), (margin, margin), (100, 0)):
+        assert board.pixelColor(*point).name() == "#ffffff", f"{point} 不是白的，静区不够"
+    dark = sum(
+        1
+        for y in range(60, 140)
+        for x in range(60, 140)
+        if board.pixelColor(x, y).red() < 128
+    )
+    assert dark > 100, f"卡片里压根没有二维码图案（黑点只有 {dark} 个）"
+
+    # 4) 面板 + 监视器：注入脚本 → 探测 → 取图 → 上屏，整条链路走一遍
+    class StubPage(QObject):
+        def __init__(self) -> None:
+            super().__init__()
+            self.grabs = 0
+
+        def runJavaScript(self, script, callback=None):  # noqa: ANN001
+            if callback is None:
+                return
+            if script == qr.PROBE_CALL:
+                callback(json.dumps({"found": True, "kind": "img", "sig": "img:stub"}))
+            elif script == qr.GRAB_CALL:
+                self.grabs += 1
+                callback(json.dumps({"found": True, "kind": "img", "value": data_url(source)}))
+            elif script == qr.REFRESH_CALL:
+                callback("click")
+
+    panel = qr.QrPanel("用测试 App 扫码", on_refresh=lambda: None)
+    page = StubPage()
+    watcher = qr.QrWatcher(page, panel)
+    watcher._tick()  # noqa: SLF001 - 第一轮：注入取码器
+    watcher._tick()  # noqa: SLF001 - 第二轮：探测到二维码 → 取图 → 上屏
+    assert page.grabs == 1, f"取图次数不对：{page.grabs}"
+    drawn = panel.canvas.pixmap()
+    assert drawn is not None and not drawn.isNull(), "面板上没有二维码"
+    assert panel.canvas.width() == qr.CARD_SIZE, panel.canvas.width()
+    watcher._tick()  # noqa: SLF001 - 同一枚二维码不该反复取图
+    assert page.grabs == 1, "签名没变却又取了一次图"
+    assert qr._loads("这不是 JSON") is None  # noqa: SLF001 - 回调可能拿到空串/脏数据
+
+    return f"位图 {side}px / 矢量 {vector.width()}px / 卡片 {qr.CARD_SIZE}px（含静区）"
+
+
 @check("检查更新：版本比较与降级路径")
 def test_updater() -> str:
     from pathlib import Path
@@ -406,6 +494,7 @@ def main(argv: list[str]) -> int:
     if "--no-ui" not in argv:
         tests.append(test_close_quits)
         tests.append(test_ui)
+        tests.append(test_qr_panel)
 
     print(f"夸克中转站 自检 · 共 {len(tests)} 项\n" + "-" * 58)
     for test in tests:
