@@ -10,8 +10,7 @@
 #>
 [CmdletBinding()]
 param(
-    [switch]$SkipTests,   # 跳过自检（只在已经确认代码没问题时用）
-    [switch]$KeepBuild    # 保留中间目录 build\（默认保留，方便排查）
+    [switch]$SkipTests   # 跳过自检（只在已经确认代码没问题时用）
 )
 
 $ErrorActionPreference = 'Stop'
