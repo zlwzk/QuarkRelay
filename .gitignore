@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# 打包产物
+build/
+dist/
+*.spec.bak
+
+# 运行时数据（都在 %APPDATA% 里，这里只是兜底）
+*.log
+logs/
+cache/
+config.json
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini

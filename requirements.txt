@@ -1,0 +1,14 @@
+# 夸克中转站 / QuarkRelay 运行依赖
+# 安装：pip install -r requirements.txt
+#
+# 说明：
+#   PySide6 的元包会同时装 Essentials 与 Addons，QtWebEngine 在内置浏览器登录里必须用到。
+#   如果之前只装了 PySide6-Essentials，需要额外装 PySide6-Addons。
+
+PySide6>=6.6,<7
+requests>=2.31
+opencv-python>=4.8
+numpy>=1.24
+
+# ---- 仅打包时需要的开发依赖 ----
+# pyinstaller>=6.1
