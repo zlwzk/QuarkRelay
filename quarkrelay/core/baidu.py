@@ -63,12 +63,17 @@ ProgressCb = Callable[[int, int], None]
 
 
 def _errno_message(payload: dict[str, Any]) -> str:
-    errno = payload.get("errno")
-    if errno in ERRNO_HINTS:
-        return ERRNO_HINTS[errno]
+    """百度自己给的文案优先，错误表只用来兜底。
+
+    顺序反了就会闹笑话：errno 2 在错误表里写的是「参数错误」，可转存失败时百度
+    给的原话是「文件已存在」——照错误表翻译，真正的原因就被盖掉了。
+    """
     show_msg = payload.get("show_msg") or payload.get("errmsg") or payload.get("error_msg")
     if show_msg:
         return str(show_msg)
+    errno = payload.get("errno")
+    if errno in ERRNO_HINTS:
+        return ERRNO_HINTS[errno]
     return f"百度网盘返回错误码 {errno}"
 
 
@@ -287,24 +292,32 @@ class BaiduClient:
     def list_share(self, share: "BaiduShare", directory: str = "/") -> list[BaiduFile]:
         if not share.share_id or not share.share_uk:
             raise BaiduError("分享信息不完整，无法读取文件列表")
+        params = {
+            "uk": share.share_uk,
+            "shareid": share.share_id,
+            "order": "other",
+            "desc": "1",
+            "showempty": "0",
+            "web": "1",
+            "page": "1",
+            "num": "500",
+            "dir": directory,
+            "t": int(time.time() * 1000),
+            "channel": "chunlei",
+            "app_id": APP_ID,
+            "bdstoken": self.bdstoken,
+            "clienttype": "0",
+        }
+        # 2026-09 起百度给 /share/list 加了「这次要列的是不是分享根目录」的判定：
+        # 列根目录必须带 root=1，否则一律回 errno 2（errmsg 是「啊哦，链接出错了」，
+        # 本地错误表把它译成「参数错误」，看着像参数写错，其实只是少了这个标记）；
+        # 列子目录则不能带 root=1 —— 带了会被忽略、永远返回根目录的内容。
+        # sekey 不用自己加：提取码校验时百度已经把 BDCLND 塞进会话 cookie 了。
+        if directory in ("", "/"):
+            params["root"] = "1"
         payload = self.session.get(
             f"{PAN}/share/list",
-            params={
-                "uk": share.share_uk,
-                "shareid": share.share_id,
-                "order": "other",
-                "desc": "1",
-                "showempty": "0",
-                "web": "1",
-                "page": "1",
-                "num": "500",
-                "dir": directory,
-                "t": int(time.time() * 1000),
-                "channel": "chunlei",
-                "app_id": APP_ID,
-                "bdstoken": self.bdstoken,
-                "clienttype": "0",
-            },
+            params=params,
             headers={"Referer": f"{PAN}/s/1{share.surl}"},
             timeout=self.timeout,
         ).json()
@@ -510,19 +523,23 @@ class BaiduClient:
         ).json()
         self._check(pre, context="预上传")
         upload_id = str(pre.get("uploadid") or "")
-        if int(pre.get("return_type") or 0) != 2 or not upload_id:
-            # return_type != 2 说明服务端已有这个文件（秒传命中），不用再传数据
-            logger.info("百度秒传命中：%s", name)
+        if not upload_id:
+            # 没给上传会话：服务端已有整份数据（秒传），数据不用再传，
+            # 但文件未必已经登记进网盘，所以必须回查确认，不能想当然。
+            # 这里不要再拿 return_type 判断：百度现在一律返回 1，老代码按
+            # 「!= 2 就是秒传命中」处理，结果一个字节都不传，还报上传成功。
+            logger.info("百度没有返回上传会话，按秒传处理：%s", name)
+            found = self.find_file(remote)
+            if found is None:
+                raise BaiduError(f"上传 {name} 失败：百度没有返回上传会话，网盘里也没有这个文件")
             if progress and size:
                 progress(size, size)
-            return self.find_file(remote) or BaiduFile(
-                fs_id=0, name=name, path=remote, size=size, is_dir=False
-            )
+            return found
 
         waiting = pre.get("block_list")
         pending = (
             [int(index) for index in waiting]
-            if isinstance(waiting, list) and waiting
+            if isinstance(waiting, list)
             else list(range(len(slices)))
         )
         uploaded = 0
@@ -573,9 +590,14 @@ class BaiduClient:
         self._check(done, context="上传收尾")
         if progress and size:
             progress(size, size)
-        return self.find_file(remote) or BaiduFile(
-            fs_id=0, name=name, path=remote, size=size, is_dir=False
-        )
+        # 以收尾接口的返回为准，它没给 fs_id 再回查列表。
+        # 以前这里会捏一个 fs_id=0 的对象返回，文件根本没进网盘也显示上传成功。
+        if done.get("fs_id"):
+            return BaiduFile.from_payload(done)
+        found = self.find_file(remote)
+        if found is None:
+            raise BaiduError(f"上传 {name} 收尾后网盘里找不到这个文件，可能没有真正落地")
+        return found
 
     # --------------------------------------------------------------- 分享创建
     def create_share(
