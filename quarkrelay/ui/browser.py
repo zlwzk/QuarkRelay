@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import threading
@@ -491,8 +492,11 @@ class WebLoginDialog(QDialog):
 
 
 # ------------------------------------------- 百度下载直链：浏览器拦截桥
+# 点「下载」之前必须先认准**是哪一行**。
+# 旧写法是「点文件列表里第一个可见的『下载』」，一个目录里只要不止一个文件，
+# 点中的就是第一行那个文件 —— 取回来的直链是别人的，还照样按目标文件的名字传上去。
 JS_CLICK_DOWNLOAD = r"""
-(function () {
+(function (fileName) {
   function visible(el) {
     if (!el) return false;
     var rect = el.getClientRects();
@@ -503,27 +507,84 @@ JS_CLICK_DOWNLOAD = r"""
             (el.getAttribute && (el.getAttribute('title') || el.getAttribute('aria-label')) || ''))
       .replace(/\s+/g, '');
   }
-  var nodes = document.querySelectorAll('a,span,div,button,i,li');
-  var best = null;
-  for (var i = 0; i < nodes.length; i++) {
-    var el = nodes[i];
-    if (!visible(el)) continue;
-    var text = label(el);
-    if (text === '下载' || text === '下载文件') {
-      // 优先选择更靠近文件列表的节点
-      best = el;
-      if (el.closest && el.closest('.nd-file-list, .file-list, [class*=filelist]')) return (el.click(), 'ok-in-list');
+  function text(el) {
+    return (el && el.textContent ? el.textContent : '').replace(/\s+/g, '');
+  }
+  var DOWNLOAD = ['下载', '下载文件', '下载到本地', '下载此文件'];
+  function findDownload(scope, loose) {
+    var nodes = scope.querySelectorAll('a,span,div,button,i,li');
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (!visible(el)) continue;
+      var text = label(el);
+      for (var j = 0; j < DOWNLOAD.length; j++) {
+        if (text === DOWNLOAD[j] || (loose && text.indexOf(DOWNLOAD[j]) >= 0)) return el;
+      }
+    }
+    return null;
+  }
+  // 一、按文件名找到那一行
+  var row = null;
+  var rows = document.querySelectorAll(
+    '[class*="file-list"] [class*="item"], [class*="filelist"] li, [class*="list-item"], tbody tr, tr'
+  );
+  for (var i = 0; i < rows.length; i++) {
+    if (text(rows[i]).indexOf(fileName) < 0) continue;
+    row = rows[i];
+    break;
+  }
+  if (!row) {
+    // 二、结构认不出来就退一步：找到写着文件名的节点，再往上找像「一行」的那层
+    var nodes = document.querySelectorAll('a,span,div');
+    for (var i = 0; i < nodes.length; i++) {
+      var node = nodes[i];
+      if (!visible(node) || label(node) !== fileName) continue;
+      var el = node;
+      for (var up = 0; up < 8 && el; up++) {
+        if (el.querySelector &&
+            (findDownload(el, false) || el.querySelector('[class*="more"], [class*="operate"], [class*="dot"]'))) {
+          row = el;
+          break;
+        }
+        el = el.parentElement;
+      }
+      if (row) break;
     }
   }
-  if (best) { best.click(); return 'ok-toolbar'; }
-  return 'not-found';
-})();
+  if (!row) return 'row-not-found';
+  // 有些界面的操作按钮是悬停才显示，先晃一下这一行
+  try {
+    row.dispatchEvent(new MouseEvent('mouseover', {bubbles: true}));
+    row.dispatchEvent(new MouseEvent('mouseenter', {bubbles: false}));
+  } catch (e) {}
+  var hit = findDownload(row, false);
+  if (hit) { hit.click(); return 'ok-row'; }
+  // 三、下载藏在「更多」菜单里：先展开菜单，再点菜单项
+  var more = null;
+  var menus = row.querySelectorAll('[class*="more"], [class*="operate"], [class*="dot"], [title*="更多"]');
+  for (var i = 0; i < menus.length; i++) {
+    if (visible(menus[i])) { more = menus[i]; break; }
+  }
+  if (!more) return 'more-not-found';
+  more.click();
+  setTimeout(function () {
+    var item = findDownload(document.body, true);
+    if (item) item.click();
+  }, 400);
+  return 'ok-menu';
+})(__FILE_NAME__);
 """
+
+
+def click_download_js(file_name: str) -> str:
+    """把文件名安全地嵌进上面那段脚本（文件名里可能有引号、中文）。"""
+    return JS_CLICK_DOWNLOAD.replace("__FILE_NAME__", json.dumps(file_name, ensure_ascii=False))
 
 
 class _DLinkJob:
     def __init__(self, path: str, timeout: float) -> None:
         self.path = path
+        self.name = path.rsplit("/", 1)[-1]
         self.event = threading.Event()
         self.url = ""
         self.error: Exception | None = None
@@ -566,15 +627,19 @@ class BaiduDownloadBridge(QObject):
         return self.page
 
     def _on_load_finished(self, ok: bool) -> None:
-        if self._job is None:
+        job = self._job
+        if job is None:
             return
         self._attempt += 1
-        self._page().runJavaScript(JS_CLICK_DOWNLOAD, self._on_js_result)
+        self._page().runJavaScript(click_download_js(job.name), self._on_js_result)
 
     def _on_js_result(self, result) -> None:
-        if self._job is None:
+        job = self._job
+        if job is None:
             return
         logger.debug("百度下载按钮点击结果：%s", result)
+        if result == "row-not-found":
+            logger.info("页面里暂时没看到「%s」这一行（可能列表还没渲染完），稍后再试", job.name)
 
     def _retry_click(self) -> None:
         job = self._job
@@ -587,11 +652,13 @@ class BaiduDownloadBridge(QObject):
             return
         if self._attempt >= 4:
             self._timer.stop()
-            message = "没能自动点到下载按钮，已打开浏览器窗口，请手动点一下「下载」"
+            message = f"没能自动点到「{job.name}」的下载，已打开浏览器窗口，请手动点它的「下载」"
             self.status_changed.emit(message)
             self.window_needed.emit(message)
+            # 窗口要真的打开、且停在这个文件所在的目录，不然用户还得自己找过去
+            self.prepare_manual(job.path)
             return
-        self._page().runJavaScript(JS_CLICK_DOWNLOAD, self._on_js_result)
+        self._page().runJavaScript(click_download_js(job.name), self._on_js_result)
 
     def _on_download_requested(self, request) -> None:
         url = request.url().toString()

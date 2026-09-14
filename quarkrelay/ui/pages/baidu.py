@@ -156,7 +156,10 @@ class CrossRelayPage(Page):
         body.addWidget(self.source_card)
 
         # ---------------------------------------------------------- ② 分享内容
-        self.files_card = Card("② 分享内容", "勾选要搬运的文件；目录暂不支持整目录搬运。")
+        self.files_card = Card(
+            "② 分享内容",
+            "勾选要搬运的文件或目录：目录会整棵搬过来，夸克那边按原层级建好目录。",
+        )
         self.files_box = QVBoxLayout()
         self.files_box.setSpacing(6)
         self.files_card.add_layout(self.files_box)
@@ -175,7 +178,7 @@ class CrossRelayPage(Page):
         target_card.add(self.quark_dir_row)
 
         self.share_name = QLineEdit()
-        self.share_name.setPlaceholderText("留空则使用第一个文件名")
+        self.share_name.setPlaceholderText("留空则用目录名／第一个文件名")
         target_card.add(FieldRow("分享名字", self.share_name))
 
         options = QHBoxLayout()
@@ -252,6 +255,12 @@ class CrossRelayPage(Page):
         )
         self.run_button.setText("开始搬运到夸克" if baidu_first else "开始搬运到百度")
         self.channel_card.setVisible(baidu_first)
+        if self.files_card.subtitle_label is not None:
+            self.files_card.subtitle_label.setText(
+                "勾选要搬运的文件或目录：目录会整棵搬过来，夸克那边按原层级建好目录。"
+                if baidu_first
+                else "夸克 → 百度目前只能搬文件：分享里若只有文件夹，先把里面的文件单独分享一下。"
+            )
 
         self.link_edit.clear()
         self.code_edit.clear()

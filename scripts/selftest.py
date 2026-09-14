@@ -668,6 +668,163 @@ def test_update_no_console_window() -> str:
     return "tasklist / find / ping 都在隐藏控制台里跑，一个窗口都没冒"
 
 
+@check("跨盘搬运：分享里的目录整棵搬过来")
+def test_relay_folder() -> str:
+    """用假客户端把「百度 → 夸克」整条链路跑一遍（不联网、不碰真账号）。
+
+    真实场景里分享常常只有一个大目录（一部剧、一个合集），老实现见到目录就直接跳过，
+    整条任务最后只剩一句「没有成功搬运任何文件」——v1.1.6 的实测反馈就是这个。
+    这条守住四件事：目录递归展开、下载路径按「中转目录 + 相对路径」拼、
+    夸克那边照原样建出子目录、百度回「文件已转存」不能当成失败。
+    """
+    from quarkrelay.core.baidu import BaiduError, BaiduFile, BaiduShare
+    from quarkrelay.core.relay import baidu_to_quark_worker
+    from quarkrelay.core.tasks import Task
+
+    next_id = [0]
+
+    def entry(name: str, path: str, size: int, is_dir: bool) -> BaiduFile:
+        next_id[0] += 1
+        return BaiduFile(fs_id=next_id[0], name=name, path=path, size=size, is_dir=is_dir)
+
+    # 分享里的样子：花儿与少年/{S1E1, S1E2, 花絮/预告}，根目录还放了个说明.txt
+    share_tree = {
+        "/": [
+            entry("花儿与少年", "/花儿与少年", 0, True),
+            entry("说明.txt", "/说明.txt", 10, False),
+        ],
+        "/花儿与少年": [
+            entry("S1E1.mp4", "/花儿与少年/S1E1.mp4", 1000, False),
+            entry("S1E2.mp4", "/花儿与少年/S1E2.mp4", 2000, False),
+            entry("花絮", "/花儿与少年/花絮", 0, True),
+        ],
+        "/花儿与少年/花絮": [entry("预告.mp4", "/花儿与少年/花絮/预告.mp4", 500, False)],
+    }
+    # 转存后我的百度网盘里的样子：故意把 S1E2 写成「(1)」，模拟同名被百度改名
+    disk_tree = {
+        "/夸克中转站": [
+            entry("花儿与少年", "/夸克中转站/花儿与少年", 0, True),
+            entry("说明.txt", "/夸克中转站/说明.txt", 10, False),
+        ],
+        "/夸克中转站/花儿与少年": [
+            entry("S1E1.mp4", "/夸克中转站/花儿与少年/S1E1.mp4", 1000, False),
+            entry("S1E2 (1).mp4", "/夸克中转站/花儿与少年/S1E2 (1).mp4", 2000, False),
+            entry("花絮", "/夸克中转站/花儿与少年/花絮", 0, True),
+        ],
+        "/夸克中转站/花儿与少年/花絮": [
+            entry("预告.mp4", "/夸克中转站/花儿与少年/花絮/预告.mp4", 500, False),
+        ],
+    }
+
+    class FakeBaidu:
+        def __init__(self) -> None:
+            self.opened: list[str] = []      # 取直链时用的路径
+            self.transfer_args: tuple | None = None
+
+        def resolve_share(self, url: str, password: str = "") -> BaiduShare:
+            return BaiduShare(surl="1selftest", title="花儿与少年")
+
+        def list_share(self, share: BaiduShare, directory: str = "/") -> list[BaiduFile]:
+            return share_tree[directory]
+
+        def list_dir(self, path: str = "/") -> list[BaiduFile]:
+            return disk_tree.get(path, [])
+
+        def transfer(self, share, fs_ids, target_path, *, on_exists: str = "rename"):
+            self.transfer_args = (len(fs_ids), target_path)
+            # 百度就是这么答的：同一份分享再搬一次会说「文件已转存」
+            raise BaiduError("转存失败：文件已转存")
+
+        def download(self, url, dest, *, referer="", progress=None, should_cancel=None, expect_size=0):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"x" * expect_size)
+            if progress:
+                progress(expect_size, expect_size)
+            return dest
+
+    class FakeQuark:
+        def __init__(self) -> None:
+            self.dirs: list[str] = []
+            self.uploads: list[tuple[str, str, int]] = []
+            self.shared: list[str] = []
+
+        def ensure_dir(self, path: str, pdir_fid: str = "0") -> str:
+            self.dirs.append(path)
+            return f"fid:{path}"
+
+        def upload_file(self, path, pdir_fid, *, remote_name="", progress=None, should_cancel=None):
+            size = path.stat().st_size
+            if progress:
+                progress(size, size)
+            self.uploads.append((pdir_fid, remote_name, size))
+            return {"fid": f"f{len(self.uploads)}"}
+
+        def share_create(self, fid_list, *, title="", url_type=2, expired_type=1):
+            self.shared = list(fid_list)
+            self.share_title = title
+            return {"share_url": "https://pan.quark.cn/s/selftest", "passcode": "", "title": title}
+
+    def run(fs_ids: list[int] | None):
+        baidu, quark = FakeBaidu(), FakeQuark()
+
+        def provide_dlink(path: str) -> str:
+            baidu.opened.append(path)
+            return "https://dlink.example/selftest"
+
+        task = Task(id="relay-selftest", kind="relay", title="自检搬运")
+        result = baidu_to_quark_worker(
+            task,
+            baidu,
+            quark,
+            share_url="https://pan.baidu.com/s/1selftest",
+            fs_ids=fs_ids,
+            baidu_dir="/夸克中转站",
+            quark_dir="夸克中转站",
+            dlink_provider=provide_dlink,
+            make_share=True,
+        )
+        return baidu, quark, task, result
+
+    # 一、勾选根目录里的全部内容：目录要递归展开，说明.txt 也不能漏
+    baidu, quark, task, result = run(None)
+    # worker 只负责干活，「成功 / 失败」由任务中心落定；能一路跑到「完成」就说明链路是通的
+    assert task.stage == "完成", f"{task.stage} / {task.error}"
+    assert baidu.transfer_args == (2, "/夸克中转站"), baidu.transfer_args
+    assert [name for _, name, _ in quark.uploads] == [
+        "S1E1.mp4",
+        "S1E2.mp4",
+        "预告.mp4",
+        "说明.txt",
+    ], quark.uploads
+    assert baidu.opened == [
+        "/夸克中转站/花儿与少年/S1E1.mp4",
+        "/夸克中转站/花儿与少年/S1E2 (1).mp4",  # 被百度改过名，也要找回来
+        "/夸克中转站/花儿与少年/花絮/预告.mp4",
+        "/夸克中转站/说明.txt",
+    ], baidu.opened
+    assert [fid for fid, _, _ in quark.uploads] == [
+        "fid:夸克中转站/花儿与少年",
+        "fid:夸克中转站/花儿与少年",
+        "fid:夸克中转站/花儿与少年/花絮",
+        "fid:夸克中转站",
+    ], quark.uploads
+    assert [size for _, _, size in quark.uploads] == [1000, 2000, 500, 10], quark.uploads
+    assert len(quark.shared) == 4, f"根目录还混着文件时应逐个分享：{quark.shared}"
+    assert task.progress == 100.0, task.progress
+    assert result["bytes"] == 3510, result["bytes"]
+
+    # 二、只勾中那个目录：夸克那边按原层级建目录，分享也直接给这个目录
+    folder_fs_id = share_tree["/"][0].fs_id
+    baidu, quark, task, _ = run([folder_fs_id])
+    assert baidu.transfer_args == (1, "/夸克中转站"), baidu.transfer_args
+    assert [name for _, name, _ in quark.uploads] == ["S1E1.mp4", "S1E2.mp4", "预告.mp4"], quark.uploads
+    assert set(quark.dirs) == {"夸克中转站/花儿与少年", "夸克中转站/花儿与少年/花絮"}, quark.dirs
+    assert quark.shared == ["fid:夸克中转站/花儿与少年"], quark.shared
+    assert quark.share_title == "花儿与少年", quark.share_title
+
+    return "目录递归展开、层级落位、转存幂等、改名找回 全部正确"
+
+
 def main(argv: list[str]) -> int:
     tmp = Path(tempfile.mkdtemp(prefix="quarkrelay-selftest-"))
     os.environ["QUARKRELAY_HOME"] = str(tmp)
@@ -693,6 +850,7 @@ def main(argv: list[str]) -> int:
         test_login_session,
         test_updater,
         test_update_no_console_window,
+        test_relay_folder,
     ]
     if "--no-ui" not in argv:
         tests.append(test_close_quits)

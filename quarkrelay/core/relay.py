@@ -9,9 +9,11 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from .baidu import BaiduClient, BaiduShare
+from .baidu import BaiduClient, BaiduFile, BaiduShare
 from .errors import BaiduError, CancelledError, QuarkError
 from .naming import build_name, render_for
 from .net import SpeedMeter, Throttle, human_size
@@ -21,6 +23,13 @@ from .tasks import Task
 logger = logging.getLogger(__name__)
 
 DLinkProvider = Callable[[str], str]
+
+# 分享里的目录最多展开这么多层，纯粹是防呆：真遇到异常结构不至于把线程卡死
+MAX_DIR_DEPTH = 8
+
+# 转存时百度说「已经转存过」的各种说法。这不算失败：
+# 内容早就在我的网盘里了，拿现有文件接着搬就行。
+ALREADY_TRANSFERRED = ("已转存", "已存在", "文件已存在", "同名文件", "已收藏")
 
 
 # --------------------------------------------------------------------- 工具
@@ -33,6 +42,136 @@ def _stage(task: Task, text: str, progress: float | None = None) -> None:
     task.set_stage(text)
     if progress is not None:
         task.set_progress(progress)
+
+
+# ----------------------------------------------------------- 搬运：分享展开
+@dataclass(frozen=True)
+class RelayedFile:
+    """展开后的一个待搬运文件。
+
+    `relative` 是相对**分享根目录**的路径，例如 `花儿与少年/S1E1.mp4`。
+    它决定了文件转存后在我的网盘里的位置，也决定了上传到对方网盘时要建哪些目录。
+    """
+
+    relative: str
+    item: BaiduFile
+
+    @property
+    def name(self) -> str:
+        return self.item.name
+
+
+def _already_transferred(message: str) -> bool:
+    return any(word in message for word in ALREADY_TRANSFERRED)
+
+
+def expand_share_files(
+    baidu: BaiduClient,
+    share: BaiduShare,
+    entries: list[BaiduFile],
+    prefix: str = "",
+    depth: int = 0,
+) -> list[RelayedFile]:
+    """把分享里选中的条目展开成文件清单：目录递归展开，层级原样保留。
+
+    分享里常常只有一个大目录（一部剧、一个合集），以前的实现见到目录就直接跳过，
+    整条任务最后只剩一句「没有成功搬运任何文件」——用户看到的就是这个。
+    """
+    if depth > MAX_DIR_DEPTH:
+        raise BaiduError(f"目录嵌套超过 {MAX_DIR_DEPTH} 层，已停止展开（分享结构可能有异常）")
+    found: list[RelayedFile] = []
+    for item in entries:
+        relative = f"{prefix}/{item.name}" if prefix else item.name
+        if not item.is_dir:
+            found.append(RelayedFile(relative, item))
+            continue
+        children = baidu.list_share(share, f"/{relative}")
+        logger.info("展开目录：%s（%d 个条目）", relative, len(children))
+        found.extend(expand_share_files(baidu, share, children, relative, depth + 1))
+    return found
+
+
+def remote_path_of(baidu_dir: str, relative: str) -> str:
+    """文件转存到我的百度网盘后的真实路径（取直链就是按这个路径去取的）。"""
+    base = "/" + (baidu_dir or "").strip().strip("/")
+    clean = relative.lstrip("/")
+    return f"{base.rstrip('/')}/{clean}" if clean else base
+
+
+def _verify_download(path: Path, item: BaiduFile, label: str) -> None:
+    """下载完立刻核对字节数。
+
+    直链是靠内置浏览器点「下载」截获的，万一截到的是别的文件，宁可在这里报错、
+    也不能把别人的文件当成目标文件传上去；顺带也能发现下载被截断的情况。
+    """
+    if not item.size:
+        return
+    try:
+        actual = path.stat().st_size
+    except OSError:
+        actual = -1
+    if actual != item.size:
+        path.unlink(missing_ok=True)
+        raise BaiduError(
+            f"「{label}」下载后大小不对（拿到 {human_size(max(0, actual))}，"
+            f"应为 {human_size(item.size)}），已丢弃这份缓冲，请重试"
+        )
+
+
+class BaiduIndex:
+    """查「转存后文件到底落在哪」。
+
+    转存是幂等的：同一份分享再搬一次，百度会回「文件已转存／已存在同名文件」，
+    意思是内容早就在我的网盘里了；同名冲突时还可能被改名成「名字 (1)」。
+    所以取直链之前先看一眼目标目录，免得拿着一个猜的路径去取。
+    """
+
+    def __init__(self, baidu: BaiduClient) -> None:
+        self.baidu = baidu
+        self._dirs: dict[str, dict[str, BaiduFile]] = {}
+
+    def _listing(self, directory: str) -> dict[str, BaiduFile]:
+        if directory not in self._dirs:
+            self._dirs[directory] = {item.name: item for item in self.baidu.list_dir(directory)}
+        return self._dirs[directory]
+
+    def locate(self, path: str) -> BaiduFile | None:
+        directory, _, name = path.rpartition("/")
+        listing = self._listing(directory or "/")
+        found = listing.get(name)
+        if found is not None:
+            return found
+        # 重名时百度会给新文件加序号，按「名字 (1)」「名字 (2)」… 找回去
+        stem, dot, suffix = name.rpartition(".")
+        base = stem if dot else name
+        ext = f".{suffix}" if dot else ""
+        for index in range(1, 100):
+            candidate = f"{base} ({index}){ext}"
+            if candidate in listing:
+                logger.info("转存后文件被改名：%s → %s", name, candidate)
+                return listing[candidate]
+        return None
+
+
+def _share_title(names: list[str], share_title: str) -> str:
+    """给生成的分享取名字：整目录搬运就用那层目录名，否则用分享标题／第一个文件名。"""
+    tops = {name.split("/")[0] for name in names}
+    if len(tops) == 1:
+        return next(iter(tops))
+    return share_title or (names[0] if names else "")
+
+
+def _share_targets(quark: QuarkClient, quark_dir: str, names: list[str], fids: list[str]) -> list[str]:
+    """整棵目录搬过来时优先分享那层目录：一个链接对一个文件夹，比逐个分享文件好用。"""
+    tops = {name.split("/")[0] for name in names}
+    if len(tops) != 1 or not any("/" in name for name in names):
+        return [fid for fid in fids if fid]
+    top = next(iter(tops))
+    try:
+        return [quark.ensure_dir(f"{quark_dir.rstrip('/')}/{top}")]
+    except QuarkError as exc:
+        logger.warning("没能定位要分享的目录「%s」：%s，改为分享文件", top, exc)
+        return [fid for fid in fids if fid]
 
 
 # ---------------------------------------------------- 流水线一：夸克中转站
@@ -139,39 +278,59 @@ def baidu_to_quark_worker(
     selected = [f for f in files if not fs_ids or f.fs_id in set(fs_ids)]
     if not selected:
         selected = files
-    targets = [f for f in selected]
+    targets = list(selected)
 
     _check_cancel(task)
-    _stage(task, "转存到我的百度网盘", 8)
+    _stage(task, "转存到我的百度网盘", 7)
     try:
         baidu.transfer(share, [f.fs_id for f in targets], baidu_dir)
     except BaiduError as exc:
-        if "已存在同名文件" not in str(exc):
+        # 转存是幂等的：同一份分享再搬一次，百度会回「文件已转存／已存在同名文件」，
+        # 意思是内容早就在我的网盘里了 —— 这不是失败，拿已有文件接着搬就行。
+        if not _already_transferred(str(exc)):
             raise
-        logger.info("百度网盘已存在同名文件，直接使用已有文件")
+        logger.info("百度网盘里已有这些内容（%s），改用已有文件继续", exc)
 
+    _check_cancel(task)
+    _stage(task, "展开目录", 9)
+    relay_files = expand_share_files(baidu, share, targets)
+    if not relay_files:
+        raise BaiduError("这个分享里没有可搬运的文件（选中的目录是空的）")
+
+    index_of = BaiduIndex(baidu)
     buffer_dir = temp_buffer_dir()
     quark_fids: list[str] = []
-    uploaded_names: list[str] = []
-    total_bytes = sum(f.size for f in targets if not f.is_dir) or 1
-    done_bytes = 0
+    uploaded: list[str] = []
+    total_bytes = sum(relayed.item.size for relayed in relay_files) or 1
+    total = len(relay_files)
     started = time.monotonic()
+    logger.info("本次要搬 %d 个文件，共 %s", total, human_size(total_bytes))
 
-    for index, item in enumerate(targets, start=1):
+    for position, relayed in enumerate(relay_files, start=1):
         _check_cancel(task)
-        if item.is_dir:
-            logger.info("跳过目录：%s（暂不支持整目录搬运）", item.name)
-            continue
+        item = relayed.item
+        label = relayed.relative
+        parent = label.rsplit("/", 1)[0] if "/" in label else ""
+        # 夸克那边按原层级建目录，不把整棵树摊平到一个目录里
+        target_dir = f"{quark_dir.rstrip('/')}/{parent}" if parent else quark_dir
+        base_progress = 9 + (position - 1) / max(1, total) * 81
 
-        remote_path = item.path if item.path.startswith("/") else f"{baidu_dir.rstrip('/')}/{item.name}"
-        base_progress = 8 + (index - 1) / max(1, len(targets)) * 82
+        _stage(task, f"确认转存位置：{label}", base_progress)
+        located = index_of.locate(remote_path_of(baidu_dir, label))
+        if located is None:
+            raise BaiduError(
+                f"转存后在我的百度网盘里没找到「{label}」，请确认中转目录「{baidu_dir}」"
+                f"里有这个文件（也可能转存还没完成），稍后重试"
+            )
+        remote_path = located.path or remote_path_of(baidu_dir, label)
 
-        _stage(task, f"获取直链：{item.name}", base_progress)
+        _check_cancel(task)
+        _stage(task, f"获取直链：{label}", base_progress + 2)
         if dlink_provider is None:
             raise BaiduError("未配置内置浏览器下载通道，无法获取百度下载直链")
         dlink = dlink_provider(remote_path)
         if not dlink:
-            raise BaiduError(f"没能获取「{item.name}」的下载直链")
+            raise BaiduError(f"没能获取「{label}」的下载直链")
 
         _check_cancel(task)
         buffer_path = buffer_dir / f"{item.fs_id}_{item.name}"
@@ -179,23 +338,30 @@ def baidu_to_quark_worker(
         throttle = Throttle(speed_kbps)
         last_seen = [0]
 
-        def _on_download(done: int, total: int, _base: float = base_progress, _meter: SpeedMeter = meter) -> None:
-            total_now = total or item.size or 1
-            fraction = min(1.0, done / total_now) if total_now else 0.0
+        def _on_download(
+            done: int,
+            total_now: int,
+            _base: float = base_progress + 2,
+            _meter: SpeedMeter = meter,
+            _label: str = label,
+            _size: int = item.size,
+        ) -> None:
+            size = total_now or _size or 1
+            fraction = min(1.0, done / size) if size else 0.0
             _stage(
                 task,
-                f"下载 {item.name} · {human_size(done)}/{human_size(total_now)}"
+                f"下载 {_label} · {human_size(done)}/{human_size(size)}"
                 f" · {human_size(_meter.speed)}/s",
                 _base + fraction * 41,
             )
 
-        def _wrapped(done: int, total: int) -> None:
+        def _wrapped(done: int, total_now: int) -> None:
             delta = done - last_seen[0]
             last_seen[0] = done
             if delta > 0:
                 throttle(delta)
             meter.update(done)
-            _on_download(done, total)
+            _on_download(done, total_now)
 
         try:
             baidu.download(
@@ -210,17 +376,24 @@ def baidu_to_quark_worker(
             if "取消" in str(exc):
                 raise CancelledError() from exc
             raise
+        _verify_download(buffer_path, item, label)
 
         _check_cancel(task)
-        _stage(task, f"上传到夸克：{item.name}", base_progress + 45)
-        quark_fid = quark.ensure_dir(quark_dir)
+        _stage(task, f"上传到夸克：{label}", base_progress + 45)
+        quark_fid = quark.ensure_dir(target_dir)
 
-        def _on_upload(done: int, total: int, _base: float = base_progress + 45) -> None:
-            total_now = total or item.size or 1
-            fraction = min(1.0, done / total_now) if total_now else 0.0
+        def _on_upload(
+            done: int,
+            total_now: int,
+            _base: float = base_progress + 45,
+            _label: str = label,
+            _size: int = item.size,
+        ) -> None:
+            size = total_now or _size or 1
+            fraction = min(1.0, done / size) if size else 0.0
             _stage(
                 task,
-                f"上传 {item.name} · {human_size(done)}/{human_size(total_now)}",
+                f"上传 {_label} · {human_size(done)}/{human_size(size)}",
                 _base + fraction * 45,
             )
 
@@ -232,7 +405,7 @@ def baidu_to_quark_worker(
             should_cancel=task.should_cancel,
         )
         quark_fids.append(str(result.get("fid") or ""))
-        uploaded_names.append(item.name)
+        uploaded.append(label)
 
         if not keep_buffer:
             try:
@@ -245,7 +418,7 @@ def baidu_to_quark_worker(
 
     elapsed = max(0.001, time.monotonic() - started)
     summary: dict[str, Any] = {
-        "files": uploaded_names,
+        "files": uploaded,
         "fids": quark_fids,
         "target_dir": quark_dir,
         "speed": total_bytes / elapsed,
@@ -255,9 +428,9 @@ def baidu_to_quark_worker(
 
     if make_share:
         _stage(task, "生成夸克分享链接", 95)
-        title = share_name or build_name(uploaded_names[0] if uploaded_names else "")
+        title = share_name or build_name(_share_title(uploaded, share.title))
         share_result = quark.share_create(
-            [fid for fid in quark_fids if fid],
+            _share_targets(quark, quark_dir, uploaded, quark_fids),
             title=title,
             url_type=url_type,
             expired_type=expired_type,
@@ -353,6 +526,19 @@ def quark_to_baidu_worker(
     items = [item for item in (detail.get("list") or []) if item.get("filename")]
     if not items:
         raise QuarkError("这个分享里没有可搬运的文件")
+
+    # 这个方向是整包转存，但下载要靠「按文件名搜回 fid」，而目录没法这么搜
+    # （开放平台没有目录列举接口），所以文件夹只能明确说清楚，别装作搬过了。
+    folders = [str(item.get("filename")) for item in items if item.get("dir")]
+    files_only = [item for item in items if not item.get("dir")]
+    if folders:
+        logger.info("分享里这些是目录，本方向暂时跳过：%s", "、".join(folders))
+    if not files_only:
+        raise QuarkError(
+            "这个分享里只有文件夹（" + "、".join(folders[:3]) + "），"
+            "「夸克 → 百度」暂时搬不了整目录；把里面的文件单独分享一下再搬"
+        )
+    items = files_only
 
     _check_cancel(task)
     _stage(task, "转存到我的夸克网盘", 8)

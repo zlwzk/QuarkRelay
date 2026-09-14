@@ -210,6 +210,12 @@ QMainWindow, QDialog, #Root {{
     color: {p.text_faint};
     font-size: 11.5px;
 }}
+#Percent {{
+    color: {p.primary};
+    font-family: "Consolas", "Cascadia Mono", monospace;
+    font-size: 12.5px;
+    font-weight: 700;
+}}
 #StepBadge {{
     background: {p.primary_soft};
     color: {p.primary_hover};

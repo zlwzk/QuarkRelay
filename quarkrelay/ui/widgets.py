@@ -84,14 +84,17 @@ class Card(QFrame):
             header.addStretch(1)
             self.header_layout = header
             outer.addLayout(header)
+            self.subtitle_label: QLabel | None = None
             if subtitle:
                 hint = QLabel(subtitle)
                 hint.setObjectName("Muted")
                 hint.setWordWrap(True)
                 outer.addWidget(hint)
+                self.subtitle_label = hint
         else:
             self.header_layout = QHBoxLayout()
             self.title_label = QLabel()
+            self.subtitle_label = None
         self.body = QVBoxLayout()
         self.body.setSpacing(10)
         outer.addLayout(self.body)
@@ -336,6 +339,9 @@ class TaskRow(QFrame):
         self.title = QLabel(task.title or task.kind)
         self.title.setObjectName("CardTitle")
         top.addWidget(self.title, 1)
+        self.percent = QLabel("")
+        self.percent.setObjectName("Percent")
+        top.addWidget(self.percent)
         self.badge = Badge(task.status.label)
         top.addWidget(self.badge)
         self.cancel_button = QPushButton("取消")
@@ -360,7 +366,14 @@ class TaskRow(QFrame):
         self.update_from(task)
 
     def update_from(self, task: Task) -> None:
-        self.progress.setValue(int(task.progress * 10))
+        running = task.status == TaskStatus.RUNNING
+        succeeded = task.status == TaskStatus.SUCCESS
+        value = 100 if succeeded else max(0, min(100, int(task.progress)))
+        self.progress.setValue(value * 10)
+        # 搬运和上传都是长活，光看进度条判断不了「还剩多少」，所以把百分比写出来
+        show_percent = succeeded or running or task.progress > 0
+        self.percent.setText(f"{value}%" if show_percent else "")
+        self.percent.setVisible(show_percent)
         text = task.error or task.stage or task.status.label
         self.detail.setText(text)
         color = {
@@ -371,8 +384,8 @@ class TaskRow(QFrame):
         self.badge.setText(task.status.label)
         self.badge.set_color(color)
         self.cancel_button.setVisible(task.status.active)
-        self.open_button.setVisible(task.status == TaskStatus.SUCCESS)
-        self.progress.setVisible(task.status == TaskStatus.RUNNING or task.progress > 0)
+        self.open_button.setVisible(succeeded)
+        self.progress.setVisible(running or task.progress > 0)
 
 
 class Toast(QFrame):
