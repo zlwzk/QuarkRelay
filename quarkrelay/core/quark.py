@@ -3,8 +3,8 @@
 鉴权：OAuth 授权码模式 —— 在内置浏览器里完成登录授权，轮询拿到 access_token /
 refresh_token，之后所有请求带 SHA256 签名头。
 
-覆盖能力：用户信息 / 容量、目录创建、文件搜索、文件详情、分享详情、转存、
-创建分享、下载直链、以及完整的分片上传（含秒传判定与断点续传）。
+覆盖能力：用户信息 / 容量、目录创建、文件搜索、文件详情、分享解析（走网页客态接口）、
+转存、创建分享、下载直链、以及完整的分片上传（含秒传判定与断点续传）。
 """
 
 from __future__ import annotations
@@ -40,6 +40,14 @@ UA = (
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 QuarkRelay/1.0"
 )
 
+# 分享「读」的两个接口，开放平台已经不提供了：同一套签名打 /open/v1/user/info、
+# /open/v1/share/saveas、/open/v1/task/query 都正常，打 /open/v1/share/detail 与
+# /open/v1/share/page_detail 却一律回 errno 10001「签名验证失败，禁止访问」——和随便编一个
+# 不存在的路径得到的响应一模一样，所以问题不在签名，是这两条路由被撤销了。
+# 于是改走网页版的「客态」接口：不用登录、不用签名，匿名就能拿到 stoken 与文件列表，
+# 而且这个 stoken 交给开放平台的 /open/v1/share/saveas 转存也被认（已实测）。
+WEB_BASE = "https://drive-pc.quark.cn/1/clouddrive"
+
 # 永久 / 1天 / 7天 / 30天 / 60天 / 100天 / 180天
 EXPIRED_TYPES = {
     "永久": 1,
@@ -66,6 +74,24 @@ def _fmt_size(size: int) -> str:
 
 def md5_of(data: bytes) -> str:
     return hashlib.md5(data).hexdigest()
+
+
+def _share_error(code: Any, message: str) -> str:
+    """把客态分享接口的错误码翻成人话（这套接口给的是 code/message）。"""
+    if code == 41006:
+        return "分享不存在或已被删除"
+    if any(word in message for word in ("提取码", "密码", "passcode")):
+        return "提取码不正确，请检查链接里的提取码"
+    if any(word in message for word in ("过期", "失效")):
+        return "分享已过期或已失效"
+    return message or f"分享接口返回错误码 {code}"
+
+
+def _normalize_share_item(item: dict[str, Any]) -> dict[str, Any]:
+    """网页接口用 file_name，开放平台用 filename：统一成 filename，调用方不用改。"""
+    if not item.get("filename") and item.get("file_name"):
+        item["filename"] = item["file_name"]
+    return item
 
 
 class QuarkAuth:
@@ -378,24 +404,110 @@ class QuarkClient:
         return None
 
     # --------------------------------------------------------------- 分享侧
+    def _web_share(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+        retries: int = 1,
+    ) -> dict[str, Any]:
+        """调一次网页版「客态」分享接口，返回整个响应包络。
+
+        这类接口既不用登录也不用签名，但只认网页端那套参数（pr/fr），
+        错误码是 `code`/`message`，跟开放平台的 `errno`/`error_info` 不是一套。
+        """
+        query: dict[str, Any] = {"pr": "ucpro", "fr": "pc"}
+        query.update({key: value for key, value in (params or {}).items() if value is not None})
+        last_error: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                response = self.session.request(
+                    method,
+                    WEB_BASE + path,
+                    params=query,
+                    json=body,
+                    timeout=self.timeout,
+                )
+                payload = response.json()
+            except (requests.RequestException, ValueError) as exc:
+                last_error = exc
+                logger.warning("客态分享接口失败(%s %s) 第%s次：%s", method, path, attempt + 1, exc)
+                time.sleep(0.8 + attempt)
+                continue
+            if not isinstance(payload, dict):
+                raise QuarkError("分享接口返回结构异常")
+            code = payload.get("code")
+            if code in (0, None):
+                return payload
+            raise QuarkError(
+                _share_error(code, str(payload.get("message") or "")),
+                code=code,
+                payload=payload,
+            )
+        raise QuarkError(f"访问分享页失败：{last_error}")
+
     def share_detail(self, pwd_id: str, passcode: str = "", page: int = 1, size: int = 200) -> dict[str, Any]:
-        body = {
-            "pwd_id": pwd_id,
-            "passcode": passcode or "",
-            "page": page,
-            "size": size,
-            "force": 0,
+        """解析分享链接：拿到 stoken 与首层文件列表（走网页客态接口）。
+
+        返回结构和开放平台时期保持一致，调用方不用改：
+        `{"token_info": {"stoken", "title", ...}, "list": [{"filename", "fid", "dir"}], "share": {...}}`
+        """
+        envelope = self._web_share(
+            "POST",
+            "/share/sharepage/token",
+            body={"pwd_id": pwd_id, "passcode": passcode or ""},
+        )
+        info = envelope.get("data") or {}
+        stoken = str(info.get("stoken") or "")
+        if not stoken:
+            raise QuarkError("分享已失效或提取码不正确")
+        listing = self.share_page_detail(pwd_id, stoken, "0", page, size)
+        return {
+            "token_info": {
+                "stoken": stoken,
+                "title": str(info.get("title") or ""),
+                "expired_at": info.get("expired_at"),
+                "expired_type": info.get("expired_type"),
+                "share_type": info.get("share_type"),
+                "url_type": info.get("url_type"),
+            },
+            "list": listing.get("list") or [],
+            "share": listing.get("share") or {},
+            "metadata": listing.get("metadata") or {},
         }
-        return self.request("POST", "/open/v1/share/detail", body, retries=1)
 
     def share_page_detail(self, pwd_id: str, stoken: str, pdir_fid: str = "0", page: int = 1, size: int = 200) -> dict[str, Any]:
-        data = self.request(
+        """列出分享里的文件（走网页客态接口）。"""
+        envelope = self._web_share(
             "GET",
-            f"/open/v1/share/page_detail?pwd_id={pwd_id}&stoken={stoken}"
-            f"&pdir_fid={pdir_fid}&_page={page}&_size={size}&_fetch_total=1&_fetch_share=1",
-            retries=1,
+            "/share/sharepage/detail",
+            params={
+                "pwd_id": pwd_id,
+                "stoken": stoken,
+                "pdir_fid": pdir_fid,
+                "force": 0,
+                "_page": page,
+                "_size": size,
+                "_fetch_banner": 0,
+                "_fetch_share": 1,
+                "_fetch_total": 1,
+                "_sort": "file_type:asc,updated_at:desc",
+                "ver": 2,
+                "fetch_share_full_path": 0,
+            },
         )
-        return data
+        data = envelope.get("data") or {}
+        return {
+            **data,
+            "list": [
+                _normalize_share_item(dict(item))
+                for item in (data.get("list") or [])
+                if isinstance(item, dict)
+            ],
+            "metadata": envelope.get("metadata") or data.get("metadata") or {},
+        }
 
     def share_saveas(
         self,
