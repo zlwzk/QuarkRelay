@@ -507,16 +507,13 @@ def test_updater() -> str:
             updater._render_script(target, source, sleeper.pid, restart=False, workdir=root),
             script,
         )
-        # 必须按真实启动方式来跑：DETACHED_PROCESS 下这个 cmd 没有控制台，
-        # 而管道（a | b）在无控制台进程里会永久挂住 —— 曾经就是这么静悄悄卡住的。
-        # 所以这里也分离启动，再轮询结果，而不是 subprocess.run 等它返回。
-        detached = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
-            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
-        )
+        # 必须按真实启动方式来跑（updater.STARTUP_FLAGS：隐藏控制台的 cmd）。
+        # 脚本里刻意不用管道（a | b）：没有控制台的 cmd 里管道会永久挂住，
+        # 曾经就是这么静悄悄卡住的。所以这里也不等它返回，而是轮询结果。
         subprocess.Popen(
             ["cmd", "/c", str(script)],
             cwd=str(script.parent),
-            creationflags=detached,
+            creationflags=updater.STARTUP_FLAGS,
             close_fds=True,
         )
         deadline = time.monotonic() + 60
@@ -592,6 +589,85 @@ def test_updater() -> str:
     )
 
 
+@check("自动更新：替换过程不弹控制台黑框")
+def test_update_no_console_window() -> str:
+    """更新脚本必须「有控制台，但窗口藏起来」。
+
+    用 DETACHED_PROCESS（完全没有控制台）时，脚本里跑的 tasklist / find / ping
+    会被系统各配一个新控制台窗口，更新时满屏黑框 —— v1.1.5 之前的实测问题。
+    所以这里不只检查启动常量，还按真实方式跑一遍那几条命令，
+    数一数屏幕上新冒出来几个可见的控制台窗口（应当一个都没有）。
+    """
+    import ctypes
+    import subprocess
+    from ctypes import wintypes
+
+    from quarkrelay.core import updater
+
+    assert updater.STARTUP_FLAGS & getattr(subprocess, "CREATE_NO_WINDOW", 0), (
+        "更新脚本要用 CREATE_NO_WINDOW 拉起，否则更新时会弹出一堆控制台窗口"
+    )
+    assert not updater.STARTUP_FLAGS & getattr(subprocess, "DETACHED_PROCESS", 0), (
+        "别用 DETACHED_PROCESS：它完全没有控制台，子命令会被系统各配一个新控制台窗口"
+    )
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    callback = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+    def visible_consoles() -> set[int]:
+        """屏幕上当前可见的控制台窗口（按句柄去重）。"""
+        found: set[int] = set()
+
+        def visit(hwnd, _) -> bool:
+            if user32.IsWindowVisible(hwnd):
+                name = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hwnd, name, 256)
+                if "consolewindow" in name.value.lower():
+                    found.add(int(hwnd))
+            return True
+
+        user32.EnumWindows(callback(visit), 0)
+        return found
+
+    with tempfile.TemporaryDirectory(prefix="qr-console-") as work:
+        root = Path(work)
+        marker = root / "done.txt"
+        script = root / "probe.bat"
+        # 脚本里这几条正是替换脚本真正会跑的命令，也是当初弹黑框的元凶。
+        # 换行交给 newline 参数处理：这里写 \n，落盘成 \r\n，别自己写 \r\n（会变成 \r\r\n）。
+        script.write_text(
+            "@echo off\n"
+            f'tasklist /FI "PID eq 888888" /NH > "{root / "t.txt"}" 2>&1\n'
+            f'find "888888" "{root / "t.txt"}" >NUL\n'
+            "ping -n 2 127.0.0.1 >NUL\n"
+            f'echo ok > "{marker}"\n',
+            encoding="mbcs",
+            newline="\r\n",
+        )
+        before = visible_consoles()
+        seen: set[int] = set()
+        subprocess.Popen(
+            ["cmd", "/c", str(script)],
+            cwd=str(root),
+            creationflags=updater.STARTUP_FLAGS,
+            close_fds=True,
+        )
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            seen |= visible_consoles() - before
+            if marker.is_file():
+                break
+            time.sleep(0.02)
+        time.sleep(0.3)  # 窗口可能要冒一下才画出来，落定后再数一次
+        seen |= visible_consoles() - before
+        # 要在临时目录还在的时候判定，出去就被删掉了
+        ran = marker.is_file()
+
+    assert ran, "自检用的批处理没跑起来（命令一条都没执行）"
+    assert not seen, f"替换脚本弹出了 {len(seen)} 个控制台窗口"
+    return "tasklist / find / ping 都在隐藏控制台里跑，一个窗口都没冒"
+
+
 def main(argv: list[str]) -> int:
     tmp = Path(tempfile.mkdtemp(prefix="quarkrelay-selftest-"))
     os.environ["QUARKRELAY_HOME"] = str(tmp)
@@ -616,6 +692,7 @@ def main(argv: list[str]) -> int:
         test_tasks,
         test_login_session,
         test_updater,
+        test_update_no_console_window,
     ]
     if "--no-ui" not in argv:
         tests.append(test_close_quits)

@@ -3,7 +3,8 @@
 Windows 上运行中的 exe 没法覆盖自己，所以自动更新分三步：
 1. 把新版下载到 `%APPDATA%\\QuarkRelay\\update\\`，校验文件头和大小（有 sha256 就再校验一遍）；
 2. 生成一个批处理，等本进程退出后把旧 exe 挪走、把新版挪进来、删掉旧版本文件与安装包残留、
-   再启动程序；
+   再启动程序。这个脚本必须用**隐藏控制台**的方式拉起（`STARTUP_FLAGS`），
+   更新全程一个黑框都不该冒出来；
 3. 调用方收到「脚本已启动」后立刻退出，剩下的活交给脚本。
 
 替换脚本万一没跑完（程序被强杀、替换失败），启动时 `cleanup_after_update()` 会兜底把
@@ -43,6 +44,15 @@ USER_AGENT = "QuarkRelay-Updater"
 # 启动时看到还在这个时间窗内的脚本，说明替换可能正在进行，不要动它的文件。
 PENDING_GRACE_SECONDS = 300
 BACKUP_SUFFIX = ".old"
+
+# 拉起替换脚本的方式：CREATE_NO_WINDOW 给 cmd 配一个「没有窗口」的控制台，
+# 脚本里跑的 tasklist / find / ping 都继承它，更新全程一个黑框都不会冒出来。
+#
+# 千万别改成 DETACHED_PROCESS：那样 cmd 自己完全没有控制台，Windows 会给它启动的
+# 每个控制台程序各配一个新控制台窗口 —— 实测一次更新能闪出十来个黑框（v1.1.5 的反馈）。
+STARTUP_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
+    subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+)
 
 
 class UpdateError(Exception):
@@ -250,9 +260,10 @@ def _verify(path: Path, info: UpdateInfo) -> None:
             raise UpdateError("更新包校验失败（sha256 不一致），已丢弃")
 
 
-# 注意：脚本里刻意不出现管道（a | b）。本进程是用 DETACHED_PROCESS 拉起来的，
-# 这种「没有控制台」的 cmd 里管道会永久挂住（tasklist | find 永远不返回），
-# 于是更新会静悄悄卡在第一步。要过滤输出就把结果先落盘、再让 find 读文件。
+# 注意：脚本里刻意不出现管道（a | b）。这种 cmd 的控制台是隐藏的（见 STARTUP_FLAGS），
+# 早先用 DETACHED_PROCESS 拉起时它压根没有控制台，管道会永久挂住
+# （tasklist | find 永远不返回），更新就静悄悄卡在第一步。
+# 要过滤输出就把结果先落盘、再让 find 读文件 —— 这套写法两种情况都稳。
 _SCRIPT = r"""@echo off
 setlocal
 {charset}set "TARGET={target}"
@@ -315,20 +326,27 @@ del /q "%UPDATEDIR%\*.exe" >NUL 2>&1
 :writelog
 echo [%DATE% %TIME%] 替换完成：旧版本文件与安装包已清理，接下来打开 %TARGETNAME% >>"%LOGFILE%"
 
-rem 打开新版本；起不来就再试两次（旧实例没退干净时新实例会被互斥体挡回去）
+rem 打开新版本；起不来就接着试（旧实例没退干净时新实例会被互斥体挡回去）。
+rem 单文件 exe 第一次启动要先把自己解包出来（260 MB 上下），慢的时候一分多钟才现身，
+rem 所以这里要耐着性子等：等三秒就下结论会误报「没能自动打开」（v1.1.5 之前就误报过）。
 :launch
 set /a tries=0
 :launch_retry
 {launch}
+set "STARTED=%errorlevel%"
 ping -n 3 127.0.0.1 >NUL
 tasklist /FI "IMAGENAME eq %TARGETNAME%" /NH > "%TEMPFILE%" 2>&1
 find /i "%TARGETNAME%" "%TEMPFILE%" >NUL
 set "RUNNING=%errorlevel%"
 del /q "%TEMPFILE%" >NUL 2>&1
-if "%RUNNING%"=="0" goto bye
+if "%RUNNING%"=="0" goto launched
 set /a tries+=1
-if %tries% lss 3 goto launch_retry
-echo [%DATE% %TIME%] 已替换成新版本，但没能自动打开，请手动双击 "%TARGET%" >>"%LOGFILE%"
+if %tries% lss 30 goto launch_retry
+echo [%DATE% %TIME%] 已替换成新版本，但等了约一分钟没能自动打开（start 返回 %STARTED%）：请手动双击 "%TARGET%" >>"%LOGFILE%"
+goto bye
+
+:launched
+echo [%DATE% %TIME%] 新版本已打开：%TARGETNAME% >>"%LOGFILE%"
 goto bye
 
 :giveup
@@ -390,14 +408,11 @@ def apply_update(new_exe: Path, *, restart: bool = True) -> Path:
     script = _write_script(
         _render_script(target, source, os.getpid(), restart=restart)
     )
-    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
-        subprocess, "CREATE_NEW_PROCESS_GROUP", 0
-    )
     try:
         subprocess.Popen(  # noqa: S603 - 命令与参数都由本模块生成，没有外部输入
             ["cmd", "/c", str(script)],
             cwd=str(script.parent),
-            creationflags=flags,
+            creationflags=STARTUP_FLAGS,
             close_fds=True,
         )
     except OSError as exc:
