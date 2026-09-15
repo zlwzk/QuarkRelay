@@ -1,6 +1,6 @@
 """夸克中转站 / QuarkRelay —— 网盘链接中转与搬运工作站。"""
 
-__version__ = "1.1.7"
+__version__ = "1.1.8"
 __app_name__ = "夸克中转站"
 __app_name_en__ = "QuarkRelay"
 __author__ = "zlwzk"
