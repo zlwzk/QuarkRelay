@@ -4,8 +4,10 @@
 # 说明：
 #   PySide6 的元包会同时装 Essentials 与 Addons，QtWebEngine 在内置浏览器登录里必须用到。
 #   如果之前只装了 PySide6-Essentials，需要额外装 PySide6-Addons。
+#   版本上限锁在 6.8.x：实测 6.12.0 在退出阶段（带命名 QWebEngineProfile 的窗口）
+#   会以 0xC0000005 崩溃，6.8.3 正常；WebEngine 在 6.10 之前就在 Addons 里，不用另装。
 
-PySide6>=6.6,<7
+PySide6>=6.8,<6.9
 requests>=2.31
 opencv-python>=4.8
 numpy>=1.24

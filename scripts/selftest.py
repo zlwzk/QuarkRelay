@@ -688,17 +688,21 @@ def test_relay_folder() -> str:
         return BaiduFile(fs_id=next_id[0], name=name, path=path, size=size, is_dir=is_dir)
 
     # 分享里的样子：花儿与少年/{S1E1, S1E2, 花絮/预告}，根目录还放了个说明.txt
+    # 注意条目 path 是带前缀的绝对路径（真实的百度分享就是这样：`/电视剧/2026-11/...`），
+    # 和它相对分享根的 relative 并不相同 —— 展开子目录时必须用前者。
     share_tree = {
         "/": [
-            entry("花儿与少年", "/花儿与少年", 0, True),
-            entry("说明.txt", "/说明.txt", 10, False),
+            entry("花儿与少年", "/电视剧/2026-11/花儿与少年", 0, True),
+            entry("说明.txt", "/电视剧/2026-11/说明.txt", 10, False),
         ],
-        "/花儿与少年": [
-            entry("S1E1.mp4", "/花儿与少年/S1E1.mp4", 1000, False),
-            entry("S1E2.mp4", "/花儿与少年/S1E2.mp4", 2000, False),
-            entry("花絮", "/花儿与少年/花絮", 0, True),
+        "/电视剧/2026-11/花儿与少年": [
+            entry("S1E1.mp4", "/电视剧/2026-11/花儿与少年/S1E1.mp4", 1000, False),
+            entry("S1E2.mp4", "/电视剧/2026-11/花儿与少年/S1E2.mp4", 2000, False),
+            entry("花絮", "/电视剧/2026-11/花儿与少年/花絮", 0, True),
         ],
-        "/花儿与少年/花絮": [entry("预告.mp4", "/花儿与少年/花絮/预告.mp4", 500, False)],
+        "/电视剧/2026-11/花儿与少年/花絮": [
+            entry("预告.mp4", "/电视剧/2026-11/花儿与少年/花絮/预告.mp4", 500, False),
+        ],
     }
     # 转存后我的百度网盘里的样子：故意把 S1E2 写成「(1)」，模拟同名被百度改名
     disk_tree = {
@@ -719,12 +723,17 @@ def test_relay_folder() -> str:
     class FakeBaidu:
         def __init__(self) -> None:
             self.opened: list[str] = []      # 取直链时用的路径
+            self.listed: list[str] = []      # 列分享目录时传的 dir
             self.transfer_args: tuple | None = None
 
         def resolve_share(self, url: str, password: str = "") -> BaiduShare:
             return BaiduShare(surl="1selftest", title="花儿与少年")
 
         def list_share(self, share: BaiduShare, directory: str = "/") -> list[BaiduFile]:
+            # 传错目录时就照百度的原样报错，免得测试里悄悄兜住问题
+            self.listed.append(directory)
+            if directory not in share_tree:
+                raise BaiduError("读取分享目录失败：百度拒绝了目录参数")
             return share_tree[directory]
 
         def list_dir(self, path: str = "/") -> list[BaiduFile]:
@@ -812,6 +821,13 @@ def test_relay_folder() -> str:
     assert len(quark.shared) == 4, f"根目录还混着文件时应逐个分享：{quark.shared}"
     assert task.progress == 100.0, task.progress
     assert result["bytes"] == 3510, result["bytes"]
+    # 列子目录必须用条目自带的绝对 path；用相对路径（/花儿与少年）百度会回 errno 2
+    assert baidu.listed[:3] == [
+        "/",
+        "/电视剧/2026-11/花儿与少年",
+        "/电视剧/2026-11/花儿与少年/花絮",
+    ], baidu.listed
+    assert "/花儿与少年" not in baidu.listed, f"不能再传相对路径：{baidu.listed}"
 
     # 二、只勾中那个目录：夸克那边按原层级建目录，分享也直接给这个目录
     folder_fs_id = share_tree["/"][0].fs_id
@@ -821,8 +837,35 @@ def test_relay_folder() -> str:
     assert set(quark.dirs) == {"夸克中转站/花儿与少年", "夸克中转站/花儿与少年/花絮"}, quark.dirs
     assert quark.shared == ["fid:夸克中转站/花儿与少年"], quark.shared
     assert quark.share_title == "花儿与少年", quark.share_title
+    assert baidu.listed[:2] == ["/", "/电视剧/2026-11/花儿与少年"], baidu.listed
 
-    return "目录递归展开、层级落位、转存幂等、改名找回 全部正确"
+    return "目录递归展开（绝对 path）、层级落位、转存幂等、改名找回 全部正确"
+
+
+@check("百度 errno 归类：参数错误不再冒充登录失效")
+def test_baidu_errno_mapping() -> str:
+    """errno 2 是「参数错误」，不能被当成登录态失效甩给用户去重新扫码。"""
+    from quarkrelay.core.baidu import BaiduAuthError, BaiduClient, BaiduError
+
+    client = BaiduClient()  # 只调 _check，不联网
+
+    try:
+        client._check({"errno": 2, "show_msg": "啊哦，链接出错了"}, context="读取分享列表")
+    except BaiduAuthError as exc:
+        raise AssertionError(f"errno 2 被误判成登录失效：{exc}") from exc
+    except BaiduError as exc:
+        assert "链接出错了" in str(exc), str(exc)
+    else:
+        raise AssertionError("errno 2 没有报错")
+
+    try:
+        client._check({"errno": -6, "show_msg": "登录已过期"}, context="读取分享列表")
+    except BaiduAuthError:
+        pass
+    else:
+        raise AssertionError("errno -6 应当仍是登录失效")
+
+    return "errno 2 → 参数错误；errno -6 → 登录失效"
 
 
 def main(argv: list[str]) -> int:
@@ -851,6 +894,7 @@ def main(argv: list[str]) -> int:
         test_updater,
         test_update_no_console_window,
         test_relay_folder,
+        test_baidu_errno_mapping,
     ]
     if "--no-ui" not in argv:
         tests.append(test_close_quits)

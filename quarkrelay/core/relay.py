@@ -85,7 +85,11 @@ def expand_share_files(
         if not item.is_dir:
             found.append(RelayedFile(relative, item))
             continue
-        children = baidu.list_share(share, f"/{relative}")
+        # 列子目录必须传条目自带的绝对 path（形如 `/上级/日期/A`）：
+        # 百度 /share/list 的 dir 只认这个，传相对路径（`/A`）一律回 errno 2
+        # 「啊哦，链接出错了」，看着像登录失效，其实只是目录参数不对。
+        directory = (item.path or "").strip() or f"/{relative}"
+        children = baidu.list_share(share, directory)
         logger.info("展开目录：%s（%d 个条目）", relative, len(children))
         found.extend(expand_share_files(baidu, share, children, relative, depth + 1))
     return found

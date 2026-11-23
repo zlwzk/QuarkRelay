@@ -211,7 +211,9 @@ class BaiduClient:
         errno = payload.get("errno")
         if errno in (0, None):
             return payload
-        if errno in (-6, 2, 400002) or "登录" in str(payload.get("show_msg") or ""):
+        # errno 2 是「参数错误」，不是登录态问题：以前把它和 -6 一起归到
+        # BaiduAuthError，用户明明登录正常却被提示去重新扫码，等于把错误指错了方向。
+        if errno in (-6, 400002) or "登录" in str(payload.get("show_msg") or ""):
             raise BaiduAuthError(_errno_message(payload))
         raise BaiduError(f"{context}失败：{_errno_message(payload)}", code=errno, payload=payload)
 
@@ -321,6 +323,13 @@ class BaiduClient:
             headers={"Referer": f"{PAN}/s/1{share.surl}"},
             timeout=self.timeout,
         ).json()
+        if payload.get("errno") == 2:
+            raise BaiduError(
+                f"读取分享目录失败：百度拒绝了目录参数「{directory}」"
+                "（目录要传条目自带的绝对 path；列根目录还必须带 root=1）",
+                code=2,
+                payload=payload,
+            )
         self._check(payload, context="读取分享列表")
         return [BaiduFile.from_payload(item) for item in payload.get("list") or []]
 
