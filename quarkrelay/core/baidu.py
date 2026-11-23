@@ -19,8 +19,10 @@ import json
 import logging
 import re
 import secrets
+import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -38,6 +40,10 @@ APP_ID = "250528"
 # 会话 Cookie 统一挂在这个域上：它覆盖 baidu.com 本身与 pan / passport / pcs 等全部子域
 BAIDU_COOKIE_DOMAIN = ".baidu.com"
 SLICE_SIZE = 4 * 1024 * 1024  # 百度网页端就是按 4MB 分片上传的
+# 下载分段：低于 8MB 的文件不值得多开连接，单段也不小于 2MB（太碎反而慢）
+MAX_DOWNLOAD_CONNECTIONS = 8
+SEGMENT_MIN_TOTAL = 8 * 1024 * 1024
+SEGMENT_MIN_SIZE = 2 * 1024 * 1024
 SHARE_PWD_CHARS = "abcdefghijkmnpqrstuvwxyz23456789"
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -682,9 +688,205 @@ class BaiduClient:
         progress: ProgressCb | None = None,
         should_cancel: Callable[[], bool] | None = None,
         expect_size: int = 0,
+        connections: int = 1,
     ) -> Path:
-        """流式下载到临时缓冲文件，支持断点续传。"""
+        """下载直链到临时缓冲文件，支持断点续传。
+
+        `connections > 1` 且文件够大时走「多连接分段下载」：先探测服务端是否支持
+        Range，再切成若干段并发拉取，每段各自续传（进度状态记在同目录的
+        `.segs.json` 里），速度通常能到单连接的 2~4 倍。服务端不支持 Range 时
+        静默退回单流下载，行为与旧版一致。
+        """
         dest.parent.mkdir(parents=True, exist_ok=True)
+        workers = max(1, min(MAX_DOWNLOAD_CONNECTIONS, int(connections or 1)))
+        total = int(expect_size or 0)
+        segments: list[tuple[int, int]] = []
+        if workers > 1:
+            try:
+                supported, probed = self._probe_range(url, referer)
+            except BaiduError:
+                supported, probed = False, 0
+            total = total or probed
+            if supported and total >= SEGMENT_MIN_TOTAL:
+                segments = _split_segments(total, workers)
+        if segments:
+            try:
+                return self._download_segments(
+                    url, dest, referer, total, segments, progress, should_cancel, workers
+                )
+            except _RangeUnsupported:
+                # 探测时支持、真下时又整份返回 200（部分 CDN 会这样），退回单流重下
+                dest.unlink(missing_ok=True)
+                _seg_state_path(dest).unlink(missing_ok=True)
+                logger.info("服务端未按 Range 返回，退回单流下载：%s", dest.name)
+        return self._download_stream(
+            url,
+            dest,
+            referer=referer,
+            progress=progress,
+            should_cancel=should_cancel,
+            expect_size=expect_size,
+        )
+
+    def _probe_range(self, url: str, referer: str) -> tuple[bool, int]:
+        """用 `Range: bytes=0-0` 探一下：支持分段就顺便拿到总大小。"""
+        headers = self.dlink_headers(referer)
+        headers["Range"] = "bytes=0-0"
+        try:
+            response = requests.get(
+                url, headers=headers, stream=True, timeout=30, allow_redirects=True
+            )
+        except requests.RequestException as exc:
+            raise BaiduError(f"探测分段下载失败：{exc}") from exc
+        try:
+            if response.status_code == 206:
+                content_range = str(response.headers.get("Content-Range") or "")
+                if "/" in content_range:
+                    tail = content_range.rsplit("/", 1)[-1].strip()
+                    if tail.isdigit():
+                        return True, int(tail)
+                return True, 0
+            if response.status_code >= 400:
+                raise BaiduError(
+                    f"直链下载被拒绝（HTTP {response.status_code}），可能链接已过期，请重试一次"
+                )
+            return False, int(response.headers.get("Content-Length") or 0)
+        finally:
+            response.close()
+
+    def _download_segments(
+        self,
+        url: str,
+        dest: Path,
+        referer: str,
+        total: int,
+        segments: list[tuple[int, int]],
+        progress: ProgressCb | None,
+        should_cancel: Callable[[], bool] | None,
+        workers: int,
+    ) -> Path:
+        state_path = _seg_state_path(dest)
+        done = _load_segments_state(state_path, total, segments)
+        if done is None:
+            done = [0] * len(segments)
+            # 预分配整份大小：各段直接往对应偏移写，不必拼文件，也不会重复占盘
+            with open(dest, "wb") as handle:
+                handle.truncate(total)
+        elif not dest.exists() or dest.stat().st_size != total:
+            with open(dest, "r+b") as handle:
+                handle.truncate(total)
+
+        lock = threading.Lock()
+        cancel_flag = threading.Event()
+        next_index = [0]
+        sum_done = [sum(done)]
+        last_report = [0.0]
+        last_state = [0.0]
+
+        def _report(force: bool = False) -> None:
+            if not progress:
+                return
+            now = time.monotonic()
+            if not force and now - last_report[0] < 0.15:
+                return
+            last_report[0] = now
+            with lock:
+                progress(sum_done[0], total)
+
+        def _save_state(force: bool = False) -> None:
+            now = time.monotonic()
+            if not force and now - last_state[0] < 1.0:
+                return
+            last_state[0] = now
+            with lock:
+                snapshot = list(done)
+            try:
+                _write_segments_state(state_path, total, segments, snapshot)
+            except OSError:
+                logger.debug("写分段进度失败：%s", state_path)
+
+        def _worker() -> None:
+            handle = open(dest, "r+b")
+            try:
+                while not cancel_flag.is_set():
+                    with lock:
+                        if cancel_flag.is_set():
+                            return
+                        index = next_index[0]
+                        if index >= len(segments):
+                            return
+                        next_index[0] += 1
+                    start, end = segments[index]
+                    offset = start + done[index]
+                    if offset > end:
+                        continue
+                    headers = self.dlink_headers(referer)
+                    headers["Range"] = f"bytes={offset}-{end}"
+                    try:
+                        response = requests.get(
+                            url, headers=headers, stream=True, timeout=60, allow_redirects=True
+                        )
+                    except requests.RequestException as exc:
+                        raise BaiduError(f"分段下载连接失败：{exc}") from exc
+                    try:
+                        if response.status_code == 200:
+                            raise _RangeUnsupported()
+                        if response.status_code >= 400:
+                            raise BaiduError(
+                                f"分段下载被拒绝（HTTP {response.status_code}），请重试一次"
+                            )
+                        handle.seek(offset)
+                        for chunk in response.iter_content(1 << 20):
+                            if should_cancel and should_cancel():
+                                cancel_flag.set()
+                                raise BaiduError("任务已取消")
+                            if not chunk:
+                                continue
+                            handle.write(chunk)
+                            offset += len(chunk)
+                            with lock:
+                                done[index] = offset - start
+                                sum_done[0] += len(chunk)
+                            _report()
+                            _save_state()
+                    finally:
+                        response.close()
+            finally:
+                handle.close()
+
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(_worker) for _ in range(workers)]
+                for future in futures:
+                    future.result()
+        except BaseException:
+            cancel_flag.set()
+            _save_state(force=True)
+            _report(force=True)
+            raise
+
+        with lock:
+            finished = sum_done[0]
+        _save_state(force=True)
+        if finished < total:
+            raise BaiduError(f"下载不完整（{finished}/{total}），请重试")
+        _report(force=True)
+        state_path.unlink(missing_ok=True)
+        logger.info("分段下载完成：%s（%s 段并发 %s）", dest.name, len(segments), workers)
+        return dest
+
+    def _download_stream(
+        self,
+        url: str,
+        dest: Path,
+        *,
+        referer: str = "",
+        progress: ProgressCb | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        expect_size: int = 0,
+    ) -> Path:
+        """单连接流式下载（多连接不可用时的保底方案，支持断点续传）。"""
+        _seg_state_path(dest).unlink(missing_ok=True)
         offset = dest.stat().st_size if dest.exists() else 0
         if expect_size and offset >= expect_size:
             if progress:
@@ -715,6 +917,58 @@ class BaiduClient:
         finally:
             response.close()
         return dest
+
+
+class _RangeUnsupported(Exception):
+    """服务端对 Range 请求回了整份 200，分段下载没法继续。"""
+
+
+def _split_segments(total: int, connections: int) -> list[tuple[int, int]]:
+    """把 [0, total-1] 切成若干段；段数约为连接数的 3 倍，收尾更均衡。"""
+    segments = max(1, min(64, connections * 3))
+    size = max(SEGMENT_MIN_SIZE, -(-total // segments))
+    out: list[tuple[int, int]] = []
+    start = 0
+    while start < total:
+        end = min(total - 1, start + size - 1)
+        out.append((start, end))
+        start = end + 1
+    return out
+
+
+def _seg_state_path(dest: Path) -> Path:
+    return dest.with_name(dest.name + ".segs.json")
+
+
+def _load_segments_state(
+    path: Path, total: int, segments: list[tuple[int, int]]
+) -> list[int] | None:
+    """读分段续传状态；文件缺失/结构不对/分段变了都当作没有。"""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or int(payload.get("total") or 0) != total:
+        return None
+    if [list(item) for item in payload.get("segments") or []] != [list(s) for s in segments]:
+        return None
+    done = payload.get("done")
+    if not isinstance(done, list) or len(done) != len(segments):
+        return None
+    try:
+        values = [max(0, min(int(v), segments[i][1] - segments[i][0] + 1)) for i, v in enumerate(done)]
+    except (TypeError, ValueError):
+        return None
+    return values
+
+
+def _write_segments_state(
+    path: Path, total: int, segments: list[tuple[int, int]], done: list[int]
+) -> None:
+    payload = {"total": total, "segments": [list(s) for s in segments], "done": done}
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    tmp.replace(path)
 
 
 @dataclass

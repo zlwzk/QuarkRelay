@@ -265,6 +265,7 @@ def baidu_to_quark_worker(
     quark_dir: str = "夸克中转站",
     dlink_provider: DLinkProvider | None = None,
     speed_kbps: int = 0,
+    connections: int = 0,
     keep_buffer: bool = False,
     share_name: str = "",
     make_share: bool = False,
@@ -365,6 +366,7 @@ def baidu_to_quark_worker(
             if delta > 0:
                 throttle(delta)
             meter.update(done)
+            task.set_transfer(done, total_now or item.size, meter.speed)
             _on_download(done, total_now)
 
         try:
@@ -375,6 +377,7 @@ def baidu_to_quark_worker(
                 progress=_wrapped,
                 should_cancel=task.should_cancel,
                 expect_size=item.size,
+                connections=connections,
             )
         except BaiduError as exc:
             if "取消" in str(exc):
@@ -385,6 +388,7 @@ def baidu_to_quark_worker(
         _check_cancel(task)
         _stage(task, f"上传到夸克：{label}", base_progress + 45)
         quark_fid = quark.ensure_dir(target_dir)
+        upload_meter = SpeedMeter()
 
         def _on_upload(
             done: int,
@@ -392,12 +396,16 @@ def baidu_to_quark_worker(
             _base: float = base_progress + 45,
             _label: str = label,
             _size: int = item.size,
+            _meter: SpeedMeter = upload_meter,
         ) -> None:
             size = total_now or _size or 1
             fraction = min(1.0, done / size) if size else 0.0
+            _meter.update(done)
+            task.set_transfer(done, size, _meter.speed)
             _stage(
                 task,
-                f"上传 {_label} · {human_size(done)}/{human_size(size)}",
+                f"上传 {_label} · {human_size(done)}/{human_size(size)}"
+                f" · {human_size(_meter.speed)}/s",
                 _base + fraction * 45,
             )
 
@@ -608,6 +616,7 @@ def quark_to_baidu_worker(
             if delta > 0:
                 throttle(delta)
             meter.update(done)
+            task.set_transfer(done, total, meter.speed)
             _on_download(done, total)
 
         _stage(task, f"从夸克下载：{filename}", base)
@@ -617,6 +626,7 @@ def quark_to_baidu_worker(
 
         _check_cancel(task)
         _stage(task, f"上传到百度网盘：{filename}", base + 36)
+        upload_meter = SpeedMeter()
 
         def _on_upload(
             done: int,
@@ -624,12 +634,16 @@ def quark_to_baidu_worker(
             _base: float = base + 36,
             _name: str = filename,
             _size: int = size,
+            _meter: SpeedMeter = upload_meter,
         ) -> None:
             total_now = total or _size or 1
             fraction = min(1.0, done / total_now) if total_now else 0.0
+            _meter.update(done)
+            task.set_transfer(done, total_now, _meter.speed)
             _stage(
                 task,
-                f"上传 {_name} · {human_size(done)}/{human_size(total_now)}",
+                f"上传 {_name} · {human_size(done)}/{human_size(total_now)}"
+                f" · {human_size(_meter.speed)}/s",
                 _base + fraction * 32,
             )
 

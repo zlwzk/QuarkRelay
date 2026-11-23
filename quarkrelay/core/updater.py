@@ -196,18 +196,37 @@ def download(
     target = Path(dest) if dest else UPDATE_DIR / (info.asset_name or "QuarkRelay.exe")
     temp = target.with_suffix(target.suffix + ".part")
 
-    done = 0
+    # 上次下到一半（断网 / 手滑取消 / 退出）时接着下，不用把两百多兆重来一遍
+    expected = int(info.asset_size or 0)
+    resume_from = temp.stat().st_size if temp.exists() else 0
+    if expected and resume_from >= expected:
+        resume_from = 0
+        temp.unlink(missing_ok=True)
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/octet-stream"}
+    if resume_from:
+        headers["Range"] = f"bytes={resume_from}-"
+
+    done = resume_from
     try:
         with requests.get(
             info.asset_url,
             stream=True,
             timeout=timeout,
             allow_redirects=True,
-            headers={"User-Agent": USER_AGENT, "Accept": "application/octet-stream"},
+            headers=headers,
         ) as response:
             response.raise_for_status()
-            total = int(response.headers.get("Content-Length") or 0) or info.asset_size
-            with open(temp, "wb") as handle:
+            if resume_from and response.status_code != 206:
+                # 服务端不认 Range（有的代理会直接回整份），只能从头来
+                resume_from = 0
+                done = 0
+                logger.info("更新包服务端不支持续传，重新完整下载")
+            total = int(response.headers.get("Content-Length") or 0)
+            if response.status_code == 206:
+                total += done
+            total = expected or total
+            mode = "ab" if resume_from else "wb"
+            with open(temp, mode) as handle:
                 for chunk in response.iter_content(chunk_size=1 << 20):
                     if should_cancel and should_cancel():
                         raise UpdateError("已取消更新")
@@ -224,7 +243,7 @@ def download(
         temp.unlink(missing_ok=True)
         raise UpdateError(f"写入更新文件失败：{exc}") from exc
     except UpdateError:
-        temp.unlink(missing_ok=True)
+        # 主动取消时留着 .part，下次可以续传
         raise
 
     _verify(temp, info)

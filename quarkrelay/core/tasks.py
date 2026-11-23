@@ -59,6 +59,10 @@ class Task:
     result: dict[str, Any] = field(default_factory=dict)
     error: str = ""
     payload: dict[str, Any] = field(default_factory=dict)
+    # 当前这一步的传输量（字节）与瞬时速度，状态栏/任务行据此显示「还剩多久」
+    done_bytes: int = 0
+    total_bytes: int = 0
+    speed_bps: float = 0.0
     _cancel: threading.Event = field(default_factory=threading.Event, repr=False)
 
     # ------------------------------------------------------------ 状态修改
@@ -68,6 +72,20 @@ class Task:
 
     def set_progress(self, value: float) -> None:
         self.progress = max(0.0, min(100.0, float(value)))
+
+    def set_transfer(self, done: int, total: int, speed_bps: float = 0.0) -> None:
+        """记录当前传输进度与速度；只保留最新一次，不参与完成判定。"""
+        self.done_bytes = max(0, int(done))
+        self.total_bytes = max(0, int(total))
+        self.speed_bps = max(0.0, float(speed_bps))
+
+    @property
+    def eta_seconds(self) -> float:
+        """按当前瞬时速度估算剩余秒数；速度未知时返回 0。"""
+        if self.speed_bps <= 0 or self.total_bytes <= 0:
+            return 0.0
+        remain = self.total_bytes - self.done_bytes
+        return max(0.0, remain / self.speed_bps)
 
     @property
     def cancelled(self) -> bool:

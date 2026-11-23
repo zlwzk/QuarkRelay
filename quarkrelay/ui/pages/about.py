@@ -100,6 +100,11 @@ class AboutPage(Page):
         self.update_hint.setObjectName("Muted")
         self.update_hint.setWordWrap(True)
         head.add(self.update_hint)
+        self.auto_label = QLabel("")
+        self.auto_label.setObjectName("Faint")
+        self.auto_label.setWordWrap(True)
+        head.add(self.auto_label)
+        self._refresh_auto_state()
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
@@ -128,6 +133,19 @@ class AboutPage(Page):
         self._updater.downloaded.connect(self._on_downloaded)
 
     # ---------------------------------------------------------------- 检查更新
+    def _refresh_auto_state(self) -> None:
+        """把「能不能自动更新」这件事写在页面上，不让人猜。"""
+        try:
+            can = updater.can_self_update()
+        except Exception:  # noqa: BLE001
+            can = False
+        if can:
+            self.auto_label.setText(
+                "自动更新：可用（下载后在程序退出时替换当前 exe 并自动重启，全程无黑框）"
+            )
+        else:
+            self.auto_label.setText("自动更新：当前不可用（源码运行或程序目录不可写，发现新版会改为打开下载页）")
+
     def check_for_update(self, silent: bool = False) -> None:
         """连 GitHub Release 查版本。silent=True 时（启动静默检查）不弹「已是最新」。"""
         if self._checking:
@@ -150,7 +168,16 @@ class AboutPage(Page):
         self.update_button.setEnabled(True)
         self.update_button.setText("检查更新")
         self._info = info
-        self.update_hint.setText(info.message)
+        if info.error:
+            self.update_hint.setText(info.message)
+        else:
+            # 一次把三件事说清：我是什么版本、线上是什么版本、差多少
+            self.update_hint.setText(
+                f"当前 v{__version__} ｜ 线上最新 v{info.version or '未知'}"
+                f"（{info.date_text or '日期未知'} · {info.size_text}）"
+                + ("　→ 有新版本" if info.has_update else "　→ 已是最新")
+            )
+        self._refresh_auto_state()
 
         if info.error:
             self.install_button.setVisible(False)

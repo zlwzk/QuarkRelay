@@ -325,6 +325,7 @@ class TaskRow(QFrame):
 
     cancel_requested = Signal(str)
     open_requested = Signal(str)
+    retry_requested = Signal(str)
 
     def __init__(self, task: Task, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -352,6 +353,11 @@ class TaskRow(QFrame):
         self.open_button.setObjectName("Ghost")
         self.open_button.clicked.connect(lambda: self.open_requested.emit(self.task_id))
         top.addWidget(self.open_button)
+        self.retry_button = QPushButton("重试")
+        self.retry_button.setObjectName("Ghost")
+        self.retry_button.clicked.connect(lambda: self.retry_requested.emit(self.task_id))
+        self.retry_button.setVisible(False)
+        top.addWidget(self.retry_button)
         layout.addLayout(top)
 
         self.progress = QProgressBar()
@@ -362,6 +368,12 @@ class TaskRow(QFrame):
         self.detail.setObjectName("Muted")
         self.detail.setWordWrap(True)
         layout.addWidget(self.detail)
+
+        # 「还剩多久」比百分比更有用，尤其是 2GB 的跨盘搬运
+        self.meta = QLabel("")
+        self.meta.setObjectName("Faint")
+        self.meta.setVisible(False)
+        layout.addWidget(self.meta)
 
         self.update_from(task)
 
@@ -376,6 +388,14 @@ class TaskRow(QFrame):
         self.percent.setVisible(show_percent)
         text = task.error or task.stage or task.status.label
         self.detail.setText(text)
+        meta = ""
+        if running and task.speed_bps > 0:
+            meta = f"{_size_text(task.speed_bps)}/s"
+            eta = task.eta_seconds
+            if eta > 0:
+                meta += f" · 剩余约 {_duration_text(eta)}"
+        self.meta.setText(meta)
+        self.meta.setVisible(bool(meta))
         color = {
             TaskStatus.SUCCESS: palette().success,
             TaskStatus.FAILED: palette().danger,
@@ -385,7 +405,28 @@ class TaskRow(QFrame):
         self.badge.set_color(color)
         self.cancel_button.setVisible(task.status.active)
         self.open_button.setVisible(succeeded)
+        self.retry_button.setVisible(task.status == TaskStatus.FAILED)
         self.progress.setVisible(running or task.progress > 0)
+
+
+def _size_text(value: float) -> str:
+    size = float(value)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def _duration_text(seconds: float) -> str:
+    total = int(max(0, seconds))
+    if total < 60:
+        return f"{total} 秒"
+    minutes, sec = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes} 分 {sec:02d} 秒"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} 小时 {minutes:02d} 分"
 
 
 class Toast(QFrame):

@@ -160,6 +160,21 @@ class CrossRelayPage(Page):
             "② 分享内容",
             "勾选要搬运的文件或目录：目录会整棵搬过来，夸克那边按原层级建好目录。",
         )
+        files_tools = QHBoxLayout()
+        files_tools.setSpacing(8)
+        self.select_all = QPushButton("全选")
+        self.select_all.setObjectName("Ghost")
+        self.select_all.clicked.connect(lambda: self._set_all_checked(True))
+        files_tools.addWidget(self.select_all)
+        self.select_none = QPushButton("全不选")
+        self.select_none.setObjectName("Ghost")
+        self.select_none.clicked.connect(lambda: self._set_all_checked(False))
+        files_tools.addWidget(self.select_none)
+        files_tools.addStretch(1)
+        self.files_summary = QLabel("还没有解析")
+        self.files_summary.setObjectName("Muted")
+        files_tools.addWidget(self.files_summary)
+        self.files_card.add_layout(files_tools)
         self.files_box = QVBoxLayout()
         self.files_box.setSpacing(6)
         self.files_card.add_layout(self.files_box)
@@ -266,7 +281,15 @@ class CrossRelayPage(Page):
         self.code_edit.clear()
         self.files_card.title_label.setText("② 分享内容" if baidu_first else "② 分享内容（整包转存预览）")
         self.files_empty.setVisible(True)
+        self.select_all.setVisible(baidu_first)
+        self.select_none.setVisible(baidu_first)
+        self.files_summary.setText("还没有解析")
         self._clear_files()
+        # 分段下载的并发数在这里也说清楚，省得用户以为是「越点越快」
+        connections = self.services.download_connections()
+        self.status_label.setText(
+            f"单文件分段下载：{connections} 连接并发（可在设置里调整）" if baidu_first else ""
+        )
 
     def _on_shot_links(self, links) -> None:
         provider = "baidu" if self.direction == BAIDU_FIRST else "quark"
@@ -403,9 +426,51 @@ class CrossRelayPage(Page):
         self.files_empty.setVisible(False)
         for item in files:
             row = FileRow(item, selectable=selectable)
+            row.check.toggled.connect(lambda _=False: self._update_summary())
             self.files_box.addWidget(row)
             self._files.append(row)
+        self._update_summary()
         Toast.show_message(self, f"解析到 {len(files)} 个条目", "success")
+
+    def _set_all_checked(self, checked: bool) -> None:
+        for row in self._files:
+            if row.check.isVisible():
+                row.check.setChecked(checked)
+
+    def _update_summary(self) -> None:
+        """解析结果的规模与已选量：搬运前心里有数，不用自己加。"""
+        if not self._files:
+            self.files_summary.setText("还没有解析")
+            return
+        total_size = sum(row.item.size for row in self._files)
+        dirs = sum(1 for row in self._files if row.item.is_dir)
+        text = f"共 {len(self._files)} 项"
+        if dirs:
+            text += f"（含 {dirs} 个目录）"
+        if total_size:
+            text += f" · {human_size(total_size)}"
+        if self.direction == BAIDU_FIRST:
+            selected = [row for row in self._files if row.enabled]
+            selected_size = sum(row.item.size for row in selected)
+            text += f" ｜ 已选 {len(selected)} 项"
+            if selected_size:
+                text += f" · {human_size(selected_size)}"
+        else:
+            text += " ｜ 整包转存"
+        self.files_summary.setText(text)
+
+    def accept_link(self, link: ShareLink) -> None:
+        """从别的页面（比如夸克中转页发现百度链接）把链接带进来。"""
+        provider = "baidu" if link.provider == "baidu" else "quark"
+        want = BAIDU_FIRST if provider == "baidu" else QUARK_FIRST
+        if want != self.direction:
+            self.direction = want
+            self._apply_direction()
+        self.link_edit.setText(link.url)
+        self.code_edit.setText(link.code)
+        Toast.show_message(
+            self, f"已填入{provider}链接，点「解析」即可选择要搬运的内容", "success"
+        )
 
     def _clear_files(self) -> None:
         while self.files_box.count():

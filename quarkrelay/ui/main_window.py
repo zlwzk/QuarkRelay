@@ -64,9 +64,16 @@ class MainWindow(QMainWindow):
 
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("准备就绪")
+        self._task_status = QLabel("")
+        self._task_status.setObjectName("Faint")
+        self.statusBar().addPermanentWidget(self._task_status)
         self._version_label = QLabel(f"v{__version__} · {pretty(APP_DIR)}")
         self._version_label.setObjectName("Faint")
         self.statusBar().addPermanentWidget(self._version_label)
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(1500)
+        self._status_timer.timeout.connect(self._refresh_task_status)
+        self._status_timer.start()
 
         self._build_tray()
         self._wire_services()
@@ -217,8 +224,35 @@ class MainWindow(QMainWindow):
         self.services.status_message.connect(self._on_status_message)
         self.services.tasks.task_added.connect(lambda _t: self._refresh_badge())
         self.services.tasks.task_changed.connect(lambda _t: self._refresh_badge())
+        transfer = self._pages.get("transfer")
+        if transfer is not None:
+            transfer.cross_relay_requested.connect(self._open_cross_relay)
         self._refresh_accounts()
         self._refresh_badge()
+        self._refresh_task_status()
+
+    def _open_cross_relay(self, link) -> None:
+        """夸克中转页发现百度链接时，把链接带到跨盘搬运页并切过去。"""
+        page = self._pages.get("baidu")
+        if page is None:
+            return
+        page.accept_link(link)
+        self.navigate("baidu")
+
+    def _refresh_task_status(self) -> None:
+        """状态栏常驻一条「几个任务在跑、加起来多快」，不用切到任务中心也能看到。"""
+        active = [task for task in self.services.tasks.tasks() if task.status.active]
+        if not active:
+            self._task_status.setText("")
+            return
+        speed = sum(task.speed_bps for task in active if task.speed_bps > 0)
+        text = f"{len(active)} 个任务进行中"
+        if speed > 0:
+            if speed >= 1024 * 1024:
+                text += f" · {speed / (1024 * 1024):.1f} MB/s"
+            else:
+                text += f" · {speed / 1024:.0f} KB/s"
+        self._task_status.setText(text)
 
     def _on_status_message(self, message: str) -> None:
         if "历史记录" in message:
@@ -249,6 +283,19 @@ class MainWindow(QMainWindow):
         self._task_badge.setVisible(count > 0)
 
     def _on_links(self, links) -> None:
+        # 剪贴板里出现百度链接、而且用户正在跨盘搬运页时，顺手填进去；
+        # 不在这一页就不打扰（免得自己切换方向）。
+        cross = self._pages.get("baidu")
+        if cross is not None and self.stack.currentWidget() is cross:
+            want = "baidu"
+            if cross.direction == 1:
+                want = "quark"
+            matched = [link for link in links if link.provider == want]
+            if matched and not cross.link_edit.text().strip():
+                cross.link_edit.setText(matched[0].url)
+                if matched[0].code:
+                    cross.code_edit.setText(matched[0].code)
+                Toast.show_message(self, f"已从剪贴板填入一条{want}链接", "info")
         quark = [link for link in links if link.provider == "quark"]
         if not quark:
             return

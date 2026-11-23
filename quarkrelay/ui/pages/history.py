@@ -46,6 +46,11 @@ class HistoryPage(Page):
         copy_all.setObjectName("Ghost")
         copy_all.clicked.connect(self._copy_all)
         toolbar.addWidget(copy_all)
+        open_btn = QPushButton("打开选中链接")
+        open_btn.setObjectName("Ghost")
+        open_btn.setToolTip("在系统浏览器里打开选中记录的分享页")
+        open_btn.clicked.connect(self._open_selected)
+        toolbar.addWidget(open_btn)
         export = QPushButton("导出 CSV")
         export.setObjectName("Ghost")
         export.clicked.connect(self._export)
@@ -90,7 +95,8 @@ class HistoryPage(Page):
         for row, record in enumerate(self._records):
             values = [
                 time.strftime("%m-%d %H:%M", time.localtime(record.created_at)),
-                {"quark_transfer": "夸克转存", "baidu_relay": "百度搬运", "share_export": "生成分享"}.get(
+                {"quark_transfer": "夸克转存", "baidu_relay": "百度搬运", "share_export": "生成分享",
+                 "quark_to_baidu": "夸克搬百度"}.get(
                     record.kind, record.kind
                 ),
                 record.name,
@@ -126,6 +132,21 @@ class HistoryPage(Page):
         text = render_many([(r.name, r.link, r.code) for r in self._records])
         copy_text(text)
         Toast.show_message(self, f"已复制 {len(self._records)} 条", "success")
+
+    def _open_selected(self) -> None:
+        """一键打开分享页，省得复制到浏览器再粘贴。"""
+        import webbrowser
+
+        records = self._selected_records()
+        if not records:
+            Toast.show_message(self, "请先选中至少一行", "warning")
+            return
+        target = next((record.link for record in records if record.link), "")
+        if not target:
+            Toast.show_message(self, "这条记录没有链接", "warning")
+            return
+        webbrowser.open(target)
+        Toast.show_message(self, "已在浏览器中打开", "success")
 
     def _export(self) -> None:
         path, _ = QFileDialog.getSaveFileName(

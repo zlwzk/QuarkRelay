@@ -126,8 +126,25 @@ class SettingsPage(Page):
         self.speed.setValue(int(cfg.get("app.speed_limit_kbps", 0) or 0))
         self.speed.valueChanged.connect(lambda value: cfg.set("app.speed_limit_kbps", value))
         row.addWidget(self.speed)
+        label3 = QLabel("下载并发连接数")
+        label3.setObjectName("Muted")
+        row.addWidget(label3)
+        self.connections = QSpinBox()
+        self.connections.setRange(1, 8)
+        self.connections.setValue(int(cfg.get("app.download_connections", 4) or 4))
+        self.connections.setToolTip("单个文件分段下载的并发连接数；1 为旧的单连接模式")
+        self.connections.valueChanged.connect(lambda value: cfg.set("app.download_connections", value))
+        row.addWidget(self.connections)
         row.addStretch(1)
         run_card.add_layout(row)
+
+        hint = QLabel(
+            "下载并发连接数只影响百度方向的单文件下载：大文件会切成多段同时拉取，"
+            "一般 4 个最稳；网络抖动明显或经常被限速时设成 1～2。"
+        )
+        hint.setObjectName("Faint")
+        hint.setWordWrap(True)
+        run_card.add(hint)
 
         self.watch_clipboard = QCheckBox("监听剪贴板，复制到夸克链接后自动填充")
         self.watch_clipboard.setChecked(bool(cfg.get("app.watch_clipboard", True)))

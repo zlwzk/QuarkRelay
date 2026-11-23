@@ -304,7 +304,15 @@ class AppServices(QObject):
             "quark_transfer",
             f"转存并分享：{name}",
             worker,
-            payload={"source": link.url, "code": link.code, "dir": directory, "name": name},
+            payload={
+                "source": link.url,
+                "pwd_id": link.pwd_id,
+                "code": link.code,
+                "dir": directory,
+                "name": name,
+                "url_type": url_type,
+                "expired_type": expired_type,
+            },
         )
 
     def start_baidu_relay(
@@ -327,6 +335,7 @@ class AppServices(QObject):
         baidu, quark = self.baidu, self.quark
         bridge = self.bridge
         speed = int(self.config.get("app.speed_limit_kbps", 0) or 0)
+        connections = self.download_connections()
 
         def worker(task: Task) -> dict[str, Any]:
             return relay.baidu_to_quark_worker(
@@ -340,6 +349,7 @@ class AppServices(QObject):
                 quark_dir=quark_dir,
                 dlink_provider=bridge.request_dlink,
                 speed_kbps=speed,
+                connections=connections,
                 keep_buffer=keep_buffer,
                 share_name=share_name,
                 make_share=make_share,
@@ -351,7 +361,16 @@ class AppServices(QObject):
             "baidu_relay",
             f"百度搬运到夸克（{share_name or '未命名'}）",
             worker,
-            payload={"share": share_url, "code": password},
+            payload={
+                "share": share_url,
+                "code": password,
+                "fs_ids": list(fs_ids or []),
+                "quark_dir": quark_dir,
+                "baidu_dir": baidu_dir,
+                "make_share": make_share,
+                "share_name": share_name,
+                "keep_buffer": keep_buffer,
+            },
         )
 
     def start_quark_to_baidu(
@@ -395,7 +414,17 @@ class AppServices(QObject):
             "quark_to_baidu",
             f"夸克搬运到百度（{share_name or '未命名'}）",
             worker,
-            payload={"source": link.url, "code": link.code},
+            payload={
+                "source": link.url,
+                "pwd_id": link.pwd_id,
+                "code": link.code,
+                "quark_dir": quark_dir,
+                "baidu_dir": baidu_dir,
+                "make_share": make_share,
+                "share_name": share_name,
+                "keep_buffer": keep_buffer,
+                "on_exists": on_exists,
+            },
         )
 
     def start_export_share(self, names: list[str], share_name: str, target_dir: str = "", parent=None) -> Task | None:
@@ -415,7 +444,101 @@ class AppServices(QObject):
                 expired_type=int(self.config.get("quark.share_expired_type", 1)),
             )
 
-        return self.tasks.submit("share_export", f"生成分享：{share_name}", worker)
+        return self.tasks.submit(
+            "share_export",
+            f"生成分享：{share_name}",
+            worker,
+            payload={"names": list(names), "share_name": share_name, "dir": directory},
+        )
+
+    # ---------------------------------------------------------------- 失败重试
+    def can_retry(self, task: Task) -> bool:
+        """失败的任务能不能原地重放：三类搬运的参数都记在 payload 里。"""
+        return task.status == TaskStatus.FAILED and task.kind in (
+            "quark_transfer",
+            "baidu_relay",
+            "quark_to_baidu",
+            "share_export",
+        )
+
+    def retry_task(self, task: Task, parent=None) -> Task | None:
+        """按原参数重新提交一次；只用于失败任务，参数不全时让用户重新发起。"""
+        payload = dict(task.payload or {})
+        kind = task.kind
+        if kind == "quark_transfer":
+            link = ShareLink(
+                url=str(payload.get("source") or ""),
+                provider="quark",
+                code=str(payload.get("code") or ""),
+                extra={"pwd_id": str(payload.get("pwd_id") or "")},
+            )
+            if not link.pwd_id:
+                self.toast.emit("这条任务缺少原链接参数，请回到页面重新发起", "warning")
+                return None
+            return self.start_quark_transfer(
+                link,
+                str(payload.get("name") or ""),
+                str(payload.get("dir") or ""),
+                url_type=payload.get("url_type"),
+                expired_type=payload.get("expired_type"),
+                parent=parent,
+            )
+        if kind == "baidu_relay":
+            share = str(payload.get("share") or "")
+            if not share:
+                self.toast.emit("这条任务缺少原分享链接，请回到跨盘搬运页重新发起", "warning")
+                return None
+            fs_ids = [int(v) for v in (payload.get("fs_ids") or [])]
+            return self.start_baidu_relay(
+                share,
+                str(payload.get("code") or ""),
+                fs_ids=fs_ids or None,
+                quark_dir=str(payload.get("quark_dir") or ""),
+                baidu_dir=str(payload.get("baidu_dir") or ""),
+                make_share=bool(payload.get("make_share", True)),
+                share_name=str(payload.get("share_name") or ""),
+                keep_buffer=bool(payload.get("keep_buffer", False)),
+                parent=parent,
+            )
+        if kind == "quark_to_baidu":
+            link = ShareLink(
+                url=str(payload.get("source") or ""),
+                provider="quark",
+                code=str(payload.get("code") or ""),
+                extra={"pwd_id": str(payload.get("pwd_id") or "")},
+            )
+            if not link.pwd_id:
+                self.toast.emit("这条任务缺少原链接参数，请回到跨盘搬运页重新发起", "warning")
+                return None
+            return self.start_quark_to_baidu(
+                link,
+                quark_dir=str(payload.get("quark_dir") or ""),
+                baidu_dir=str(payload.get("baidu_dir") or ""),
+                make_share=bool(payload.get("make_share", True)),
+                share_name=str(payload.get("share_name") or ""),
+                keep_buffer=bool(payload.get("keep_buffer", False)),
+                on_exists=str(payload.get("on_exists") or "rename"),
+                parent=parent,
+            )
+        if kind == "share_export":
+            names = [str(v) for v in (payload.get("names") or [])]
+            if not names:
+                self.toast.emit("这条任务缺少文件清单，请回到页面重新发起", "warning")
+                return None
+            return self.start_export_share(
+                names,
+                str(payload.get("share_name") or ""),
+                str(payload.get("dir") or ""),
+                parent=parent,
+            )
+        return None
+
+    def download_connections(self) -> int:
+        """单文件分段下载的并发连接数（1 = 旧的单连接模式）。"""
+        try:
+            return max(1, min(8, int(self.config.get("app.download_connections", 4) or 4)))
+        except (TypeError, ValueError):
+            return 4
 
     # ---------------------------------------------------------------- 任务回调
     def _on_task_finished(self, task: Task) -> None:

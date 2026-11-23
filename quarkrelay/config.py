@@ -41,6 +41,7 @@ DEFAULTS: dict[str, Any] = {
         "hotkey_main": "",
         "max_parallel": 2,
         "speed_limit_kbps": 0,
+        "download_connections": 4,
         "close_to_tray": True,
         "notify_on_finish": True,
         "copy_after_share": True,

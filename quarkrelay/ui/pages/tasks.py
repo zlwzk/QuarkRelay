@@ -68,10 +68,19 @@ class TasksPage(Page):
     def _on_added(self, task) -> None:
         row = TaskRow(task)
         row.cancel_requested.connect(self.services.tasks.cancel)
+        row.retry_requested.connect(self._retry)
         self.list_box.insertWidget(0, row)
         self._rows[task.id] = row
         self.empty.setVisible(False)
         self._refresh_stats()
+
+    def _retry(self, task_id: str) -> None:
+        task = self.services.tasks.get(task_id)
+        if task is None:
+            return
+        new_task = self.services.retry_task(task, parent=self.window())
+        if new_task is not None:
+            Toast.show_message(self, "已按原参数重新排队", "info")
 
     def _on_changed(self, task) -> None:
         row = self._rows.get(task.id)

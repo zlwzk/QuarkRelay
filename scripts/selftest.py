@@ -668,6 +668,125 @@ def test_update_no_console_window() -> str:
     return "tasklist / find / ping 都在隐藏控制台里跑，一个窗口都没冒"
 
 
+@check("百度下载：多连接分段 / 续传 / 退回单流")
+def test_parallel_download() -> str:
+    """多连接分段下载：真开一个支持 Range 的本地服务，验内容、验续传、验退回单流。"""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from quarkrelay.core.baidu import BaiduClient
+    from quarkrelay.core.errors import BaiduError
+
+    payload = bytes(range(256)) * 40000  # 10.24 MB，跨多个分段
+    total = len(payload)
+
+    class Handler(BaseHTTPRequestHandler):
+        support_range = True
+        slow = 0.0  # 取消续传测试用：每个 256KB 块之间歇一会儿，才有机会在中途掐掉
+
+        def log_message(self, *args) -> None:  # noqa: ANN002 - 静音访问日志
+            return
+
+        def _send(self, body: bytes) -> None:
+            step = 256 * 1024
+            for offset in range(0, len(body), step):
+                try:
+                    self.wfile.write(body[offset : offset + step])
+                except (ConnectionResetError, BrokenPipeError):
+                    # 取消测试里客户端会主动断开，属于预期
+                    self.close_connection = True
+                    return
+                if Handler.slow:
+                    time.sleep(Handler.slow)
+
+        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 约定
+            rng = self.headers.get("Range")
+            if rng and Handler.support_range:
+                start_text, _, end_text = rng.replace("bytes=", "").partition("-")
+                start = int(start_text or 0)
+                end = min(int(end_text) if end_text else total - 1, total - 1)
+                body = payload[start : end + 1]
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self._send(body)
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", str(total))
+            self.end_headers()
+            self._send(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_address[1]}/file.bin"
+    client = BaiduClient()
+    try:
+        with tempfile.TemporaryDirectory(prefix="qr-seg-") as work:
+            dest = Path(work) / "buffer.bin"
+            progress_state = {"last": 0}
+
+            def progress(done: int, total_now: int) -> None:
+                progress_state["last"] = done
+                progress_state["total"] = total_now
+
+            client.download(url, dest, expect_size=total, connections=4, progress=progress)
+            assert dest.read_bytes() == payload, "分段下载拼出来的内容不对"
+            assert progress_state["last"] == total
+            assert not (Path(work) / "buffer.bin.segs.json").exists(), "下完后分段状态该删掉"
+
+            # 中途取消 → 再跑一次应该接着下，而不是从头来
+            Handler.slow = 0.05  # 整份约 0.5 秒，0.2 秒时一定下到一半
+            state = {"done": 0}
+
+            def tracker(done: int, _total: int) -> None:
+                state["done"] = max(state["done"], done)
+
+            cancel_start = time.monotonic()
+
+            def cancel_soon() -> bool:
+                return time.monotonic() - cancel_start > 0.2
+
+            try:
+                client.download(
+                    url,
+                    dest,
+                    expect_size=total,
+                    connections=4,
+                    progress=tracker,
+                    should_cancel=cancel_soon,
+                )
+            except BaiduError as exc:
+                assert "取消" in str(exc), exc
+            else:
+                raise AssertionError("取消后仍返回成功，说明没在检查取消标志")
+            Handler.slow = 0.0
+            assert Path(work, "buffer.bin.segs.json").exists(), "取消后要留下分段续传状态"
+
+            resumed = {"start": 0}
+
+            def resumed_progress(done: int, _total: int) -> None:
+                if not resumed["start"]:
+                    resumed["start"] = done
+
+            client.download(url, dest, expect_size=total, connections=4, progress=resumed_progress)
+            assert dest.read_bytes() == payload, "续传后的内容不对"
+            assert resumed["start"] > 0, "再下时应该从已下部分继续，而不是从 0 开始"
+
+            # 服务端不支持 Range：必须静默退回单流下载，内容仍然正确
+            Handler.support_range = False
+            no_range_dest = Path(work) / "norange.bin"
+            client.download(url, no_range_dest, expect_size=total, connections=4)
+            assert no_range_dest.read_bytes() == payload, "不支持 Range 时退回单流下载失败"
+            Handler.support_range = True
+    finally:
+        server.shutdown()
+        server.server_close()
+    return f"10MB / 4 连接 / 续传 / 退回单流 全部通过"
+
+
 @check("跨盘搬运：分享里的目录整棵搬过来")
 def test_relay_folder() -> str:
     """用假客户端把「百度 → 夸克」整条链路跑一遍（不联网、不碰真账号）。
@@ -744,7 +863,11 @@ def test_relay_folder() -> str:
             # 百度就是这么答的：同一份分享再搬一次会说「文件已转存」
             raise BaiduError("转存失败：文件已转存")
 
-        def download(self, url, dest, *, referer="", progress=None, should_cancel=None, expect_size=0):
+        def download(
+            self, url, dest, *, referer="", progress=None, should_cancel=None, expect_size=0,
+            connections=0,
+        ):
+            self.connections = connections
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(b"x" * expect_size)
             if progress:
@@ -893,6 +1016,7 @@ def main(argv: list[str]) -> int:
         test_login_session,
         test_updater,
         test_update_no_console_window,
+        test_parallel_download,
         test_relay_folder,
         test_baidu_errno_mapping,
     ]

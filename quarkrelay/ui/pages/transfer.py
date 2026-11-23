@@ -95,11 +95,14 @@ class TransferPage(Page):
     title = "夸克中转站"
     subtitle = "粘贴别人的夸克分享链接，自动转存到你的网盘目录，并生成一条属于你的分享链接（名字 + 链接直接复制走）"
 
+    cross_relay_requested = Signal(object)
+
     def __init__(self, services, parent=None) -> None:
         super().__init__(services, parent)
         self._rows: list[LinkRow] = []
         self._result_rows: list[CopyRow] = []
         self._my_tasks: set[str] = set()
+        self._baidu_links: list[ShareLink] = []
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(450)
@@ -133,6 +136,11 @@ class TransferPage(Page):
         clear_btn.setObjectName("Ghost")
         clear_btn.clicked.connect(lambda: self.input.setPlainText(""))
         actions.addWidget(clear_btn)
+        self.baidu_btn = QPushButton("百度链接？去跨盘搬运")
+        self.baidu_btn.setObjectName("Ghost")
+        self.baidu_btn.setVisible(False)
+        self.baidu_btn.clicked.connect(self._send_baidu_links)
+        actions.addWidget(self.baidu_btn)
         self.count_label = QLabel("尚未识别到链接")
         self.count_label.setObjectName("Muted")
         actions.addWidget(self.count_label, 1)
@@ -304,11 +312,21 @@ class TransferPage(Page):
         self.links_empty.setVisible(not links)
         self.links_card.title_label.setText("识别到的链接")
         quark_count = sum(1 for link in links if link.provider == "quark")
+        self._baidu_links = [link for link in links if link.provider == "baidu"]
+        self.baidu_btn.setVisible(bool(self._baidu_links))
+        if self._baidu_links:
+            self.baidu_btn.setText(f"把 {len(self._baidu_links)} 条百度链接带去跨盘搬运")
         if links:
             extra = "" if quark_count == len(links) else f"（其中夸克 {quark_count} 条）"
             self.count_label.setText(f"共识别到 {len(links)} 条链接{extra}")
         else:
             self.count_label.setText("尚未识别到链接")
+
+    def _send_baidu_links(self) -> None:
+        """百度链接在这个页面办不了，一键带到跨盘搬运页，省得重新复制。"""
+        if not self._baidu_links:
+            return
+        self.cross_relay_requested.emit(self._baidu_links[0])
 
     def _remove_row(self, row: LinkRow) -> None:
         self._rows = [item for item in self._rows if item is not row]
