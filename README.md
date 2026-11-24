@@ -2,7 +2,7 @@
 
 把「别人的网盘链接」变成「你自己的分享链接」。
 
-**当前版本：v1.2.0** · Windows 10/11 · 单文件 exe，免安装
+**当前版本：v1.2.1** · Windows 10/11 · 目录版（启动约 3 秒）/ 单文件版（免安装）
 
 ---
 
@@ -131,10 +131,14 @@ QuarkRelay 要做的事情很简单：
 
 ## 安装与运行
 
-### 方式一：下载 exe（推荐）
+### 方式一：下载后直接运行
 
-去 [Releases](https://github.com/zlwzk/QuarkRelay/releases/latest) 下载
-`QuarkRelay.exe`，双击就能用，不需要装 Python 或任何运行库。
+去 [Releases](https://github.com/zlwzk/QuarkRelay/releases/latest) 下载：
+
+- **`QuarkRelay-win64.zip`（推荐，启动约 2~3 秒）**：解压到任意目录，运行里面的 `QuarkRelay.exe`。目录版不用每次解包，是目前唯一能真正解决启动慢的形态。
+- `QuarkRelay.exe`：单文件免安装版，功能一致；但每次启动都要先解包约 560 MB，冷启动约 20 秒。
+
+两种形态都不需要装 Python 或任何运行库，登录状态与历史记录共用 `%APPDATA%\QuarkRelay`。
 
 ### 方式二：从源码跑
 
@@ -147,15 +151,21 @@ python main.py
 
 要求 Python 3.10+（推荐 3.11 ~ 3.13）。
 
-### 打包 exe
+### 打包
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\build.ps1
+powershell -ExecutionPolicy Bypass -File scripts\build.ps1              # 单文件 + 目录版
+powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Mode fast   # 只打目录版
+powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Mode single # 只打单文件版
 ```
 
-脚本会依次：生成内置文档 → 跑自检 → 生成图标 → PyInstaller 单文件打包 →
-**启动 exe 做一次离屏自检**（装配界面 + 真正渲染一个网页，确认内置浏览器在打包后还能用），
-产物在 `dist\QuarkRelay.exe`。
+脚本会依次：生成内置文档 → 跑自检 → 生成图标 → PyInstaller 打包 →
+**每种形态都启动一次做离屏自检**（装配界面 + 真正渲染一个网页，确认内置浏览器在打包后还能用）。
+产物：
+
+- `dist\QuarkRelay.exe`（单文件版）
+- `dist\QuarkRelay\QuarkRelay.exe`（目录版）
+- `dist\QuarkRelay-win64.zip`（目录版压缩包，Release 资产）
 
 想单独验证手上的 exe 是否完好，可以直接跑：
 

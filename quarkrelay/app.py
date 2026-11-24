@@ -149,8 +149,8 @@ def self_check() -> int:
         from .ui.theme import PALETTES, apply_theme
         from .ui.widgets import set_palette
 
-        palette = apply_theme(app, "dark")
-        set_palette(PALETTES.get("dark", palette))
+        palette = apply_theme(app, "light")
+        set_palette(PALETTES.get("light", palette))
         checks["qss"] = len(app.styleSheet())
     except Exception as exc:  # noqa: BLE001
         problems.append(f"主题装配失败：{exc}")
@@ -160,8 +160,10 @@ def self_check() -> int:
         from .ui.services import AppServices
 
         services = AppServices()
-        window = MainWindow(services, theme="dark")
+        window = MainWindow(services, theme="light")
         window.show()
+        app.processEvents()
+        window.preload_all_pages()
         app.processEvents()
         checks["pages"] = window.stack.count()
         window.close()
@@ -232,6 +234,41 @@ def self_check() -> int:
     return _finish(0 if not problems else 1)
 
 
+def update_report() -> int:
+    """把「当前运行形态 + 线上最新版本 + 会下载哪个资产」写成 JSON。
+
+    目录版和单文件版的更新通道不一样（一个拿 zip、一个拿 exe），发版后要能用一条
+    命令验证选择是否正确，不用去点关于页。
+    """
+    import json
+    import tempfile
+
+    from .core import updater
+
+    info = updater.check()
+    payload = {
+        "local_version": __version__,
+        "portable": updater.is_portable(),
+        "can_self_update": updater.can_self_update(),
+        "remote_version": info.version,
+        "has_update": info.has_update,
+        "asset_name": info.asset_name,
+        "asset_size": info.asset_size,
+        "asset_digest": info.asset_digest,
+        "published_at": info.published_at,
+        "error": info.error,
+    }
+    path = Path(tempfile.gettempdir()) / "quarkrelay-update.json"
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    try:
+        path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        _safe_print(f"写更新报告失败：{exc}")
+        return 1
+    _safe_print(text)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--version" in argv or "-v" in argv:
@@ -239,11 +276,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if "--check" in argv:
         return self_check()
+    if "--update-report" in argv:
+        return update_report()
     if "--help" in argv or "-h" in argv:
         _safe_print(
             f"{__app_name__} v{__version__}\n"
-            "用法：QuarkRelay.exe [--help] [--version] [--check]\n"
-            "  --check    离屏自检（装配界面与内置浏览器），结果写入 %TEMP%\\quarkrelay-selfcheck.json\n"
+            "用法：QuarkRelay.exe [--help] [--version] [--check] [--update-report]\n"
+            "  --check          离屏自检（装配界面与内置浏览器），结果写入 %TEMP%\\quarkrelay-selfcheck.json\n"
+            "  --update-report  查询线上最新版本与本机更新通道，结果写入 %TEMP%\\quarkrelay-update.json\n"
             "所有功能都在图形界面里，平时直接双击运行即可。"
         )
         return 0
@@ -286,7 +326,14 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(str(cfg.get("app.log_level", "INFO")))
     _install_excepthook()
 
-    theme_name = str(cfg.get("app.theme", "dark") or "dark")
+    # v1.2.1 起全站统一白底：老的深色偏好只迁移一次，之后仍可在设置页切回深色
+    if str(cfg.get("app.theme", "light") or "light") == "dark" and not bool(
+        cfg.get("app.migrated_white_theme", False)
+    ):
+        cfg.set("app.theme", "light", autosave=False)
+        cfg.set("app.migrated_white_theme", True)
+
+    theme_name = str(cfg.get("app.theme", "light") or "light")
     palette = apply_theme(app, theme_name)
     set_palette(PALETTES.get(theme_name, palette))
     app.setWindowIcon(app_icon(256))

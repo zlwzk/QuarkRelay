@@ -24,7 +24,6 @@ from PySide6.QtWidgets import (
 from ...core.errors import friendly
 from ...core.links import ShareLink, extract
 from ...core.net import human_size
-from ..browser import ManualDLinkDialog
 from ..shot import ScreenshotButton, pick_links
 from ..widgets import Badge, Card, EmptyState, FieldRow, Toast, palette
 from . import Page
@@ -318,6 +317,8 @@ class CrossRelayPage(Page):
             self.code_edit.setText(link.code)
 
     def _manual(self) -> None:
+        from ..browser import ManualDLinkDialog  # 延迟导入：别让启动就拉起 WebEngine
+
         dialog = ManualDLinkDialog(self, self._manual_dlink)
         if dialog.exec() == dialog.DialogCode.Accepted:
             self._manual_dlink = dialog.value()

@@ -256,16 +256,18 @@ def test_ui() -> str:
 
     app = QApplication.instance()
     assert isinstance(app, QApplication), "没有可用的 QApplication"
-    palette = apply_theme(app, "dark")
+    palette = apply_theme(app, "light")
     assert palette is not None
 
     from quarkrelay.ui.widgets import set_palette
 
-    set_palette(PALETTES.get("dark", palette))
+    set_palette(PALETTES.get("light", palette))
     assert len(TEMPLATE_PRESETS) >= 5, "命名预设不足五种"
 
     services = AppServices()
-    window = MainWindow(services, theme="dark")
+    window = MainWindow(services, theme="light")
+    # v1.2.1 起页面按需装配，自检里手动把全部页面建出来
+    window.preload_all_pages()
     pages = list(window._pages)  # noqa: SLF001 - 自检里直接看内部结构
     assert len(pages) >= 7, f"页面数量不对：{pages}"
     for key in ("transfer", "baidu", "tasks", "history", "accounts", "settings", "about"):

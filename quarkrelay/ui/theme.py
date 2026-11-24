@@ -56,23 +56,24 @@ DARK = Palette(
 
 LIGHT = Palette(
     name="light",
-    bg="#F3F6FC",
+    # 全部页面统一白底：窗口、侧栏、卡片、滚动区都是纯白，只靠 1px 浅灰描边分层
+    bg="#FFFFFF",
     surface="#FFFFFF",
-    surface_alt="#F7F9FE",
+    surface_alt="#F7F9FC",
     elevated="#FFFFFF",
-    border="#DCE4F2",
-    border_soft="#E8EEF9",
-    text="#101828",
-    text_dim="#5A6B87",
-    text_faint="#8A99B5",
+    border="#E1E7F0",
+    border_soft="#EEF2F8",
+    text="#0F172A",
+    text_dim="#55657C",
+    text_faint="#8A97AB",
     primary="#2563EB",
     primary_hover="#1D4ED8",
-    primary_soft="#E4EDFF",
-    accent="#0891B2",
-    success="#059669",
-    warning="#D97706",
+    primary_soft="#EBF1FF",
+    accent="#0E7490",
+    success="#0F9D58",
+    warning="#C77700",
     danger="#DC2626",
-    shadow="rgba(15,23,42,0.10)",
+    shadow="rgba(15,23,42,0.08)",
 )
 
 PALETTES = {"dark": DARK, "light": LIGHT}
@@ -125,6 +126,13 @@ QWidget {{
 }}
 QMainWindow, QDialog, #Root {{
     background: {p.bg};
+}}
+/* 页面容器一律跟主题底色走，避免滚动区/栈里的默认灰底把白底切碎 */
+QStackedWidget, QStackedWidget > QWidget {{
+    background: {p.bg};
+}}
+QScrollArea, QScrollArea > QWidget > QWidget {{
+    background: transparent;
 }}
 
 /* ---------------------------------------------------------------- 侧边栏 */

@@ -19,9 +19,11 @@ import hashlib
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
+import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -105,8 +107,22 @@ def is_newer(remote: str, local: str = "") -> bool:
     return _parse(remote) > _parse(local or __version__)
 
 
+def is_portable() -> bool:
+    """是不是「目录版」（exe 旁边有 _internal）。目录版更新要整包替换，不能只换 exe。"""
+    exe = current_exe()
+    return bool(exe and (exe.parent / "_internal").is_dir())
+
+
 def _pick_asset(assets: list[dict]) -> dict:
-    """挑出要下载的附件：优先和当前 exe 同名的，其次任意 exe。"""
+    """挑出要下载的附件。
+
+    目录版（快速启动版）优先拿 zip 整包：只换 exe 会和 _internal 里的 DLL 版本对不上；
+    单文件版仍然拿 exe。
+    """
+    if is_portable():
+        zips = [a for a in assets if str(a.get("name") or "").lower().endswith(".zip")]
+        if zips:
+            return zips[0]
     candidates = [a for a in assets if str(a.get("name") or "").lower().endswith(".exe")]
     if not candidates:
         return {}
@@ -256,7 +272,7 @@ def download(
 
 
 def _verify(path: Path, info: UpdateInfo) -> None:
-    """最小但有效的校验：大小对得上 + 真的是 Windows 可执行文件。"""
+    """最小但有效的校验：大小对得上 + 真的是可用的包。"""
     size = path.stat().st_size
     if size <= 0:
         path.unlink(missing_ok=True)
@@ -264,10 +280,21 @@ def _verify(path: Path, info: UpdateInfo) -> None:
     if info.asset_size and size != info.asset_size:
         path.unlink(missing_ok=True)
         raise UpdateError(f"下载不完整（{human_size(size)}/{human_size(info.asset_size)}），请重试")
-    with open(path, "rb") as handle:
-        if handle.read(2) != b"MZ":
+    if path.suffix.lower() == ".zip":
+        try:
+            with zipfile.ZipFile(path) as archive:
+                names = archive.namelist()
+        except (zipfile.BadZipFile, OSError) as exc:
             path.unlink(missing_ok=True)
-            raise UpdateError("下载到的文件不是可执行程序，已丢弃")
+            raise UpdateError(f"更新包已损坏（{exc}），请重试") from exc
+        if not any(name.lower().endswith(".exe") for name in names):
+            path.unlink(missing_ok=True)
+            raise UpdateError("更新包里没有可执行程序，已丢弃")
+    else:
+        with open(path, "rb") as handle:
+            if handle.read(2) != b"MZ":
+                path.unlink(missing_ok=True)
+                raise UpdateError("下载到的文件不是可执行程序，已丢弃")
     if info.asset_digest.startswith("sha256:"):
         expected = info.asset_digest.split(":", 1)[1].strip().lower()
         digest = hashlib.sha256()
@@ -380,8 +407,76 @@ exit /b 0
 """
 
 
-def _render_script(
-    target: Path,
+_DIR_SCRIPT = r"""@echo off
+setlocal
+{charset}set "TARGET={target}"
+set "SOURCE={source}"
+set "TARGETDIR={targetdir}"
+set "TARGETNAME={targetname}"
+set "UPDATEDIR={updatedir}"
+set "PID={pid}"
+set "TEMPFILE={tempfile}"
+set "LOGFILE={logfile}"
+set /a waited=0
+
+:wait
+tasklist /FI "PID eq %PID%" /NH > "%TEMPFILE%" 2>&1
+find "%PID%" "%TEMPFILE%" >NUL
+set "ALIVE=%errorlevel%"
+del /q "%TEMPFILE%" >NUL 2>&1
+if not "%ALIVE%"=="0" goto replace
+set /a waited+=1
+if %waited% geq 60 goto replace
+ping -n 2 127.0.0.1 >NUL
+goto wait
+
+rem 目录版整包替换：用 robocopy 镜像，exe 与 _internal 一起换，避免版本错配
+:replace
+if not exist "%SOURCE%\%TARGETNAME%" goto giveup
+robocopy "%SOURCE%" "%TARGETDIR%" /MIR /NFL /NDL /NJH /NJS /R:2 /W:1 >NUL
+set "RC=%errorlevel%"
+if %RC% geq 8 goto giveup
+if not exist "%TARGET%" goto giveup
+
+:cleanpack
+rmdir /s /q "%SOURCE%" >NUL 2>&1
+del /q "%UPDATEDIR%\*.part" >NUL 2>&1
+del /q "%UPDATEDIR%\*.zip" >NUL 2>&1
+del /q "%UPDATEDIR%\old-pid.txt" >NUL 2>&1
+
+:writelog
+echo [%DATE% %TIME%] 目录版替换完成：新版本文件已覆盖，安装包已清理 >>"%LOGFILE%"
+
+:launch
+set /a tries=0
+:launch_retry
+start "" /d "%TARGETDIR%" "%TARGET%"
+ping -n 3 127.0.0.1 >NUL
+tasklist /FI "IMAGENAME eq %TARGETNAME%" /NH > "%TEMPFILE%" 2>&1
+find /i "%TARGETNAME%" "%TEMPFILE%" >NUL
+set "RUNNING=%errorlevel%"
+del /q "%TEMPFILE%" >NUL 2>&1
+if "%RUNNING%"=="0" goto launched
+set /a tries+=1
+if %tries% lss 12 goto launch_retry
+echo [%DATE% %TIME%] 已替换，但没能自动打开：请手动双击 "%TARGET%" >>"%LOGFILE%"
+goto bye
+
+:launched
+echo [%DATE% %TIME%] 新版本已打开：%TARGETNAME% >>"%LOGFILE%"
+goto bye
+
+:giveup
+echo [%DATE% %TIME%] 目录版自动更新失败：没能把 "%SOURCE%" 覆盖到 "%TARGETDIR%" >>"%LOGFILE%"
+goto bye
+
+:bye
+(goto) 2>NUL & del "%~f0"
+exit /b 0
+"""
+
+
+def _render_script(target: Path,
     source: Path,
     pid: int,
     *,
@@ -415,6 +510,62 @@ def _write_script(text: str, path: Path | None = None) -> Path:
     return script
 
 
+def _render_dir_script(
+    target: Path,
+    source_dir: Path,
+    pid: int,
+    *,
+    restart: bool = True,
+    workdir: Path | None = None,
+) -> str:
+    """目录版替换脚本：用 robocopy 把新目录镜像过去。"""
+    work = Path(workdir) if workdir else UPDATE_DIR
+    return _DIR_SCRIPT.format(
+        charset="",
+        target=target,
+        source=source_dir,
+        targetdir=target.parent,
+        targetname=target.name,
+        updatedir=work,
+        pid=pid,
+        tempfile=work / "old-pid.txt",
+        logfile=work / UPDATE_LOG_NAME,
+        launch='start "" /d "%TARGETDIR%" "%TARGET%"' if restart else "goto bye",
+    )
+
+
+def _stage_zip(archive: Path, exe_name: str) -> Path:
+    """把更新 zip 解到 update\\staging，返回含 exe 的那一层目录。"""
+    stage = UPDATE_DIR / "staging"
+    shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir(parents=True, exist_ok=True)
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            zf.extractall(stage)
+    except (zipfile.BadZipFile, OSError) as exc:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise UpdateError(f"解压更新包失败：{exc}") from exc
+
+    root = stage
+    entries = list(stage.iterdir())
+    if len(entries) == 1 and entries[0].is_dir():
+        root = entries[0]
+
+    exe = root / exe_name
+    if not exe.is_file():
+        found = list(root.glob("*.exe")) or list(stage.rglob("*.exe"))
+        if not found:
+            shutil.rmtree(stage, ignore_errors=True)
+            raise UpdateError("更新包里没有 exe")
+        exe = found[0]
+        root = exe.parent
+    with open(exe, "rb") as handle:
+        if handle.read(2) != b"MZ":
+            shutil.rmtree(stage, ignore_errors=True)
+            raise UpdateError("更新包里的 exe 不完整，已丢弃")
+    return root
+
+
 def apply_update(new_exe: Path, *, restart: bool = True) -> Path:
     """生成并启动替换脚本；调用方紧接着应该退出程序。返回脚本路径。"""
     target = current_exe()
@@ -424,9 +575,16 @@ def apply_update(new_exe: Path, *, restart: bool = True) -> Path:
     if not source.is_file():
         raise UpdateError("更新包不见了，请重新下载")
 
-    script = _write_script(
-        _render_script(target, source, os.getpid(), restart=restart)
-    )
+    if source.suffix.lower() == ".zip":
+        # 目录版：先解压到 staging，再让脚本在退出后整体镜像过去
+        staging = _stage_zip(source, target.name)
+        script = _write_script(
+            _render_dir_script(target, staging, os.getpid(), restart=restart)
+        )
+    else:
+        script = _write_script(
+            _render_script(target, source, os.getpid(), restart=restart)
+        )
     try:
         subprocess.Popen(  # noqa: S603 - 命令与参数都由本模块生成，没有外部输入
             ["cmd", "/c", str(script)],
@@ -527,7 +685,20 @@ def cleanup_after_update(
 
     if work.is_dir():
         for path in sorted(work.iterdir()):
-            if not path.is_file() or path.name == UPDATE_LOG_NAME:
+            if path.is_dir():
+                # 目录版更新留下的解压目录
+                if path.name == "staging":
+                    try:
+                        size = sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+                    except OSError:
+                        size = 0
+                    shutil.rmtree(path, ignore_errors=True)
+                    if not path.exists():
+                        report.files.append(path)
+                        report.freed += size
+                        logger.info("已清理更新解压目录：%s（%s）", path, human_size(size))
+                continue
+            if path.name == UPDATE_LOG_NAME:
                 continue
             freed = _unlink_sized(path)
             if path.exists():

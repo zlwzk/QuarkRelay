@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+import threading
+
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from ...paths import APP_DIR, pretty
@@ -56,8 +58,13 @@ class AccountsPage(Page):
     title = "账号管理"
     subtitle = "两个网盘的登录都在内置浏览器里完成，Cookie / 令牌只存在本机，不会动你系统浏览器里的登录状态"
 
+    storage_ready = Signal(str)
+
     def __init__(self, services, parent=None) -> None:
         super().__init__(services, parent)
+        self._storage_busy = False
+        self._storage_text = ""
+        self.storage_ready.connect(self._on_storage)
         body = self.scrollable()
 
         quark_card = Card("夸克网盘", "通过夸克网盘开放平台的授权码流程登录，授权成功后本程序只保存访问令牌与刷新令牌。")
@@ -111,7 +118,8 @@ class AccountsPage(Page):
             Toast.show_message(self, "还没登录夸克网盘", "warning")
             return
         self.refresh()
-        Toast.show_message(self, "已刷新夸克账号信息", "info")
+        self._fetch_storage()
+        Toast.show_message(self, "正在刷新夸克账号信息", "info")
 
     def _login_baidu(self) -> None:
         if self.services.login_baidu(self):
@@ -128,11 +136,39 @@ class AccountsPage(Page):
 
     # ------------------------------------------------------------------ 刷新
     def refresh(self) -> None:
+        """刷新两张卡片。
+
+        容量是网络数据：有缓存就直接用，没缓存就丢到后台线程去取，绝不卡住主线程。
+        """
         quark_in = self.services.quark_logged_in
-        storage = self.services.quark_storage() if quark_in else ""
+        if quark_in and not self._storage_text and not self._storage_busy:
+            self._fetch_storage()
+        self._render(quark_in, self._storage_text)
+
+    def _fetch_storage(self) -> None:
+        self._storage_busy = True
+
+        def _worker() -> None:
+            text = ""
+            try:
+                text = self.services.quark_storage(refresh=True)
+            finally:
+                self.storage_ready.emit(text)
+
+        threading.Thread(target=_worker, name="quark-storage", daemon=True).start()
+
+    def _on_storage(self, text: str) -> None:
+        self._storage_busy = False
+        if text:
+            self._storage_text = text
+        self._render(self.services.quark_logged_in, self._storage_text)
+
+    def _render(self, quark_in: bool, storage: str) -> None:
         detail = f"账号：{self.services.quark_display()}"
         if storage:
             detail += f"　·　{storage}"
+        elif quark_in:
+            detail += "　·　容量读取中…"
         if not quark_in:
             detail = "未登录。点左侧按钮，在弹出的浏览器窗口里用夸克 App 扫码授权即可。"
         self.quark_widget.set_state(quark_in, detail)

@@ -188,7 +188,8 @@
 * 单实例运行（命名互斥体）
 * 未捕获异常会写日志并弹窗提示，附带日志目录路径
 * 高 DPI 适配（Per-Monitor V2）
-* 明暗两套主题，全部走同一套设计 token
+* 默认白底主题（全站纯白 + 1px 浅灰描边），保留深色主题可切换
+* 启动优化：页面按需装配、内置浏览器按需加载、账号容量后台刷新；目录版启动约 3 秒
 
 ---
 
@@ -202,6 +203,6 @@
 | 百度 | 网页版接口：gettemplatevariable / share/verify / share/list / share/transfer / `api/list` / `api/create` / `api/precreate` / `superfile2` / `share/set` |
 | OCR | Windows.Media.Ocr（PowerShell WinRT 桥）|
 | 二维码 | OpenCV QRCodeDetector |
-| 更新 | GitHub Releases API + 校验下载 + 批处理自替换（删旧版本 / 清安装包 / 重启） |
+| 更新 | GitHub Releases API + 校验下载 + 批处理自替换（单文件换 exe / 目录版整包镜像覆盖，删旧版本、清安装包、重启） |
 | 存储 | JSON 配置 + SQLite 历史 |
-| 打包 | PyInstaller 单文件 |
+| 打包 | PyInstaller：目录版（启动快）+ 单文件版 |

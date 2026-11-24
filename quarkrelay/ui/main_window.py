@@ -37,9 +37,21 @@ from .widgets import StatusDot, Toast, set_palette
 
 logger = logging.getLogger(__name__)
 
+# (页面 key, 侧栏文案, 页面类)。页面只在第一次切过去时才实例化：
+# 七个页面一起装配会拖慢首屏，而且账号页会顺手发网络请求。
+PAGE_ENTRIES = (
+    ("transfer", "夸克中转", TransferPage),
+    ("baidu", "跨盘搬运", CrossRelayPage),
+    ("tasks", "任务中心", TasksPage),
+    ("history", "历史记录", HistoryPage),
+    ("accounts", "账号管理", AccountsPage),
+    ("settings", "设置", SettingsPage),
+    ("about", "关于", AboutPage),
+)
+
 
 class MainWindow(QMainWindow):
-    def __init__(self, services: AppServices, theme: str = "dark") -> None:
+    def __init__(self, services: AppServices, theme: str = "light") -> None:
         super().__init__()
         self.services = services
         self.theme_name = theme
@@ -48,7 +60,7 @@ class MainWindow(QMainWindow):
         self.resize(1280, 860)
         self.setMinimumSize(1080, 720)
 
-        self._nav_buttons: list[QPushButton] = []
+        self._nav_buttons: dict[str, QPushButton] = {}
         self._pages: dict[str, QWidget] = {}
         self._task_badge: QLabel | None = None
         self._really_quit = False
@@ -118,15 +130,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(brand)
         layout.addSpacing(16)
 
-        entries = [
-            ("transfer", "夸克中转", TransferPage),
-            ("baidu", "跨盘搬运", CrossRelayPage),
-            ("tasks", "任务中心", TasksPage),
-            ("history", "历史记录", HistoryPage),
-            ("accounts", "账号管理", AccountsPage),
-            ("settings", "设置", SettingsPage),
-            ("about", "关于", AboutPage),
-        ]
+        entries = PAGE_ENTRIES
         self._group = QButtonGroup(self)
         self._group.setExclusive(True)
         for key, label, _cls in entries:
@@ -136,7 +140,7 @@ class MainWindow(QMainWindow):
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.clicked.connect(lambda _=False, name=key: self.navigate(name))
             self._group.addButton(button)
-            self._nav_buttons.append(button)
+            self._nav_buttons[key] = button
             layout.addWidget(button)
             if key == "tasks":
                 row = QHBoxLayout()
@@ -169,35 +173,44 @@ class MainWindow(QMainWindow):
 
     def _build_stack(self) -> QWidget:
         self.stack = QStackedWidget()
-        for key, _label, cls in (
-            ("transfer", "", TransferPage),
-            ("baidu", "", CrossRelayPage),
-            ("tasks", "", TasksPage),
-            ("history", "", HistoryPage),
-            ("accounts", "", AccountsPage),
-            ("settings", "", SettingsPage),
-            ("about", "", AboutPage),
-        ):
-            page = cls(self.services)
-            self._pages[key] = page
-            self.stack.addWidget(page)
+        # 首屏只装「夸克中转」这一页，其余页面等用户真的点过去再建
+        self._ensure_page("transfer")
         return self.stack
+
+    def _ensure_page(self, key: str) -> QWidget | None:
+        page = self._pages.get(key)
+        if page is not None:
+            return page
+        entry = next((item for item in PAGE_ENTRIES if item[0] == key), None)
+        if entry is None:
+            return None
+        page = entry[2](self.services)
+        if key == "transfer":
+            page.cross_relay_requested.connect(self._open_cross_relay)
+        self._pages[key] = page
+        self.stack.addWidget(page)
+        return page
+
+    def preload_all_pages(self) -> None:
+        """把全部页面装配出来（只给离屏自检用，正常启动不调用）。"""
+        for key, _label, _cls in PAGE_ENTRIES:
+            self._ensure_page(key)
+
+    @property
+    def page_count(self) -> int:
+        return len(PAGE_ENTRIES)
 
     # ---------------------------------------------------------------- 导航
     def navigate(self, key: str) -> None:
-        page = self._pages.get(key)
+        page = self._ensure_page(key)
         if page is None:
             return
         self.stack.setCurrentWidget(page)
-        for index, button in enumerate(self._nav_buttons):
-            if self._page_key(index) == key:
-                button.setChecked(True)
+        for name, button in self._nav_buttons.items():
+            button.setChecked(name == key)
         refresh = getattr(page, "refresh", None)
         if callable(refresh):
             refresh()
-
-    def _page_key(self, index: int) -> str:
-        return list(self._pages.keys())[index] if index < len(self._pages) else ""
 
     def trigger_screenshot(self) -> None:
         """全局快捷键 / 托盘里的「截图识链」：直接交给当前页的小相机按钮。
@@ -224,16 +237,13 @@ class MainWindow(QMainWindow):
         self.services.status_message.connect(self._on_status_message)
         self.services.tasks.task_added.connect(lambda _t: self._refresh_badge())
         self.services.tasks.task_changed.connect(lambda _t: self._refresh_badge())
-        transfer = self._pages.get("transfer")
-        if transfer is not None:
-            transfer.cross_relay_requested.connect(self._open_cross_relay)
         self._refresh_accounts()
         self._refresh_badge()
         self._refresh_task_status()
 
     def _open_cross_relay(self, link) -> None:
         """夸克中转页发现百度链接时，把链接带到跨盘搬运页并切过去。"""
-        page = self._pages.get("baidu")
+        page = self._ensure_page("baidu")
         if page is None:
             return
         page.accept_link(link)

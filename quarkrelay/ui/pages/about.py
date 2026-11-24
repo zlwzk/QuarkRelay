@@ -140,8 +140,9 @@ class AboutPage(Page):
         except Exception:  # noqa: BLE001
             can = False
         if can:
+            mode = "目录版会下载整包并整体替换" if updater.is_portable() else "下载后会替换当前 exe"
             self.auto_label.setText(
-                "自动更新：可用（下载后在程序退出时替换当前 exe 并自动重启，全程无黑框）"
+                f"自动更新：可用（{mode}，程序退出时完成替换并自动重启，全程无黑框）"
             )
         else:
             self.auto_label.setText("自动更新：当前不可用（源码运行或程序目录不可写，发现新版会改为打开下载页）")

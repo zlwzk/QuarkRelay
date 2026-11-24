@@ -34,7 +34,8 @@ DEFAULTS: dict[str, Any] = {
         "user_agent": "",
     },
     "app": {
-        "theme": "dark",
+        "theme": "light",
+        "migrated_white_theme": False,
         "watch_clipboard": True,
         "auto_transfer": False,
         "hotkey_screenshot": "Ctrl+Alt+Q",

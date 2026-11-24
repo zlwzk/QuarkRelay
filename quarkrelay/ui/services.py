@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Any
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -18,14 +19,10 @@ from ..core.naming import render_for
 from ..core.quark import QuarkAuth, QuarkClient
 from ..core.tasks import Task, TaskCenter, TaskStatus
 from ..store import Record, history
-from .browser import (
-    BAIDU_KEYS,
-    BaiduDownloadBridge,
-    WebLoginDialog,
-    clear_profile_cookies,
-    cookie_string,
-    profile,
-)
+
+# 注意：内置浏览器（QtWebEngine）是启动最重的一块。它在模块顶层导入会让程序
+# 每次启动都先加载 147 MB 的 Qt6WebEngineCore.dll，窗口硬生生晚出来两秒多，
+# 所以这里只在真正需要登录 / 下载通道时再导入（见 _browser()）。
 
 logger = logging.getLogger(__name__)
 
@@ -48,14 +45,32 @@ class AppServices(QObject):
         self.history = history()
         self.quark = self._make_quark()
         self.baidu = self._make_baidu()
-        self.bridge = BaiduDownloadBridge(self)
+        self._bridge = None
+        self._storage_text = ""
+        self._storage_at = 0.0
         self._last_clipboard = ""
         self._clipboard_timer = QTimer(self)
         self._clipboard_timer.setInterval(900)
         self._clipboard_timer.timeout.connect(self._poll_clipboard)
         if self.config.get("app.watch_clipboard", True):
-            self._clipboard_timer.start()
+            # 延迟到窗口显示之后再开始轮询剪贴板：960 px 的 QGuiApplication 调用
+            # 在冷启动时也会抢主线程，先让首屏出来
+            QTimer.singleShot(1200, self._clipboard_timer.start)
         self.tasks.task_finished.connect(self._on_task_finished)
+
+    @staticmethod
+    def _browser():
+        """按需加载内置浏览器模块（导入即加载 QtWebEngine）。"""
+        from . import browser
+
+        return browser
+
+    @property
+    def bridge(self):
+        """百度下载通道桥：第一次用到时才创建，免得启动就拉起 WebEngine。"""
+        if self._bridge is None:
+            self._bridge = self._browser().BaiduDownloadBridge(self)
+        return self._bridge
 
     # ------------------------------------------------------------------ 客户端
     def _make_quark(self) -> QuarkClient:
@@ -94,14 +109,25 @@ class AppServices(QObject):
             return "未登录"
         return str(self.config.get("baidu.nickname", "") or "") or "已登录"
 
-    def quark_storage(self) -> str:
+    def quark_storage(self, *, refresh: bool = False, max_age: float = 600.0) -> str:
+        """夸克容量。
+
+        容量要发一次网络请求，以前每次刷新账号卡片都会同步等它回来，窗口一开就卡住
+        两三秒。现在先给缓存（默认 10 分钟内直接用），只有用户点「刷新容量」才真的去问。
+        """
         if not self.quark_logged_in:
             return ""
+        now = time.monotonic()
+        if not refresh and self._storage_text and now - self._storage_at < max_age:
+            return self._storage_text
         try:
-            return self.quark.storage_summary()
+            value = self.quark.storage_summary()
         except Exception as exc:  # noqa: BLE001
             logger.debug("读取夸克容量失败：%s", exc)
-            return ""
+            return self._storage_text
+        self._storage_text = value or ""
+        self._storage_at = now
+        return self._storage_text
 
     def _persist_quark(self) -> None:
         for key, value in self.quark.auth.to_dict().items():
@@ -132,7 +158,7 @@ class AppServices(QObject):
             self.toast.emit(f"打开夸克授权页失败：{friendly(exc)}", "error")
             return False
 
-        dialog = WebLoginDialog(
+        dialog = self._browser().WebLoginDialog(
             "登录夸克网盘",
             "直接用夸克 App 扫下面这枚二维码就行，它就是授权页里的那一枚（放大过，更好扫）。"
             "授权结果由后台自动确认，成功后会立即关闭本窗口；登录数据只保存在本机 "
@@ -197,9 +223,10 @@ class AppServices(QObject):
         return False
 
     def login_baidu(self, parent=None) -> bool:
+        browser = self._browser()
         # 直接进 passport 的扫码页：以前落在网盘首页，还得自己找「登录」按钮，
         # 弹出来的登录框里二维码又小又居右，扫起来别扭。
-        dialog = WebLoginDialog(
+        dialog = browser.WebLoginDialog(
             "登录百度网盘",
             "直接用百度 App 扫下面这枚二维码就行，它就是登录页里的那一枚（放大过，更好扫）。"
             "检测到登录后窗口会自动关闭。会话 Cookie 只保存在本机，不会写入系统浏览器，"
@@ -207,7 +234,7 @@ class AppServices(QObject):
             "https://passport.baidu.com/v2/?login&tpl=netdisk&u=https%3A%2F%2Fpan.baidu.com%2Fdisk%2Fmain",
             "baidu",
             autodetect=lambda cookies: bool(cookies.get("BDUSS")),
-            cookie_keys=BAIDU_KEYS,
+            cookie_keys=browser.BAIDU_KEYS,
             parent=parent,
             qr_hint="用百度 App 扫码登录",
         )
@@ -215,7 +242,7 @@ class AppServices(QObject):
             return False
         # 只认 baidu.com 域下的 cookie：不同域可能有同名项，混在一起会互相覆盖。
         cookies = dialog.jar.cookies_for("baidu.com") or dialog.jar.cookies or dialog.cookies
-        cookie_text = cookie_string(cookies, BAIDU_KEYS) or cookie_string(cookies)
+        cookie_text = browser.cookie_string(cookies, browser.BAIDU_KEYS) or browser.cookie_string(cookies)
         if "BDUSS" not in cookie_text:
             self.toast.emit("没有取到会话信息（BDUSS），可能登录还没完成", "warning")
             return False
@@ -225,7 +252,7 @@ class AppServices(QObject):
         except BaiduAuthError as exc:
             # 浏览器里留着一份过期会话时，光看「有没有 BDUSS」会一直判成已登录，
             # 于是窗口刚开就自己关了，用户永远扫不到码。失效就把它清掉。
-            clear_profile_cookies(profile("baidu"))
+            browser.clear_profile_cookies(browser.profile("baidu"))
             self.toast.emit(friendly(exc), "error")
             return False
         except Exception as exc:  # noqa: BLE001
